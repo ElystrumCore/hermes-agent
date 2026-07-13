@@ -19,6 +19,7 @@ class Decision:
 @runtime_checkable
 class Brain(Protocol):
     def decide(self, soul_render: str, goals: list[Goal], recent: list) -> Decision: ...
+    def verify_done(self, goal_text: str, output: str) -> bool: ...
 
 
 class MockBrain:
@@ -41,6 +42,9 @@ class MockBrain:
             idle=False,
             done=done,
         )
+
+    def verify_done(self, goal_text: str, output: str) -> bool:
+        return True
 
 
 import json as _json
@@ -135,3 +139,15 @@ class LiveBrain:
             idle=bool(data.get("idle", False)) or not action,
             done=bool(data.get("done", False)),
         )
+
+    def verify_done(self, goal_text: str, output: str) -> bool:
+        try:
+            from hermes_cli.oneshot import _run_agent
+            prompt = (
+                f"Goal: {goal_text}\n\nResult of the latest action:\n{(output or '')[:1500]}\n\n"
+                "Is the goal now fully satisfied by this result? Answer with a single word: yes or no."
+            )
+            resp, _ = _run_agent(prompt, model=self._model)
+            return _parse_yes(resp or "")
+        except Exception:  # noqa: BLE001 — unverified => not done
+            return False
