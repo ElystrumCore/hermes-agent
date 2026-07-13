@@ -26,6 +26,10 @@ class Memory:
         self._records: list[TickRecord] = []
         self._done: set[str] = set()
 
+    @property
+    def dir(self) -> str:
+        return str(self._dir)
+
     def record(self, rec: TickRecord) -> None:
         self._records.append(rec)
         with self._path.open("a", encoding="utf-8", newline="\n") as fh:
