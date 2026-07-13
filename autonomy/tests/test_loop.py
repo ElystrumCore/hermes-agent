@@ -1,5 +1,5 @@
 from autonomy.brain import MockBrain
-from autonomy.hands import MockHands
+from autonomy.hands import MockHands, Outcome
 from autonomy.heartbeat import Heartbeat
 from autonomy.loop import AutonomyLoop, NullGate
 from autonomy.memory import Memory
@@ -61,3 +61,34 @@ def test_deny_gate_records_skipped_outcome_and_does_not_act(tmp_path):
     report = loop.run()
     assert any("gate denied" in f for f in report.failures)
     assert report.completed == []          # act never ran -> no completion
+
+
+class _FailingHands:
+    def act(self, decision):
+        return Outcome(ok=False, output="", error="boom")
+
+
+def test_failed_act_does_not_mark_goal_done(tmp_path):
+    loop = _loop(tmp_path, brain=MockBrain(ticks_per_goal=1), hands=_FailingHands(),
+                 hb=Heartbeat(max_ticks=3, no_progress_window=99))
+    report = loop.run()
+    assert report.terminate_reason == "max_ticks"
+    assert report.completed == []          # decision.done was True but the act failed -> no fabricated progress
+    assert report.failures != []
+
+
+class _CountingHeartbeat(Heartbeat):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wait_calls = 0
+
+    def wait(self) -> None:
+        self.wait_calls += 1
+        super().wait()
+
+
+def test_run_calls_heartbeat_wait_once_per_tick(tmp_path):
+    hb = _CountingHeartbeat(max_ticks=20, no_progress_window=99)
+    loop = _loop(tmp_path, brain=MockBrain(ticks_per_goal=1), hb=hb)
+    report = loop.run()
+    assert hb.wait_calls == report.ticks

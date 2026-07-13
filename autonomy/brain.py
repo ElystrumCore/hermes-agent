@@ -72,11 +72,12 @@ class LiveBrain:
             if not m:
                 return _IDLE_FAIL
             data = _json.loads(m.group(0))
+            action = str(data.get("action", "")).strip()
             return Decision(
                 target_goal=data.get("target_goal"),
-                action=str(data.get("action", "")),
+                action=action,
                 rationale=str(data.get("rationale", "")),
-                idle=bool(data.get("idle", False)),
+                idle=bool(data.get("idle", False)) or not action,
                 done=bool(data.get("done", False)),
             )
         except Exception:

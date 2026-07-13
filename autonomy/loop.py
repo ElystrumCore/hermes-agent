@@ -63,7 +63,7 @@ class AutonomyLoop:
                 outcome = self.hands.act(decision)
                 self._action_count += 1
                 self.gate.after_act(decision, outcome)
-                if decision.done and decision.target_goal:
+                if outcome.ok and decision.done and decision.target_goal:
                     self.memory.mark_done(decision.target_goal)
 
         goal_states = {g.id: (g.id in self.memory.completed_goals()) for g in self.soul.all_goals()}
@@ -89,5 +89,6 @@ class AutonomyLoop:
             )
             if not rec.outcome.ok:
                 report.failures.append(report.summaries[-1])
+            self.heartbeat.wait()
         report.completed = sorted(self.memory.completed_goals())
         return report

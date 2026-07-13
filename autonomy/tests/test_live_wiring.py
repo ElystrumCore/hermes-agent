@@ -27,6 +27,15 @@ def test_live_brain_parses_valid_json(monkeypatch):
     assert d.target_goal == "g1" and d.action == "do X" and d.idle is False
 
 
+def test_live_brain_empty_action_forces_idle(monkeypatch):
+    _fake_oneshot(monkeypatch, lambda prompt, model=None: (
+        '{"target_goal":"g1","rationale":"x"}',
+        {},
+    ))
+    d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
+    assert d.idle is True and d.action == ""
+
+
 def test_live_brain_fail_closed_on_garbage(monkeypatch):
     _fake_oneshot(monkeypatch, lambda prompt, model=None: ("no json here at all", {}))
     d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
