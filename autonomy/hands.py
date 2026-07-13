@@ -24,3 +24,18 @@ class MockHands:
 
     def act(self, decision: Decision) -> Outcome:
         return Outcome(ok=True, output=f"[mock-hands] {decision.action}", error=None)
+
+
+class HermesHands:
+    """Live actuator: execute the action via Hermes _run_agent (a full one-shot run)."""
+
+    def __init__(self, model=None) -> None:
+        self._model = model
+
+    def act(self, decision: Decision) -> Outcome:
+        try:
+            from hermes_cli.oneshot import _run_agent
+            final_response, _ = _run_agent(decision.action, model=self._model)
+            return Outcome(ok=True, output=final_response or "", error=None)
+        except Exception as exc:  # noqa: BLE001 — a failed action is recorded, never crashes the loop
+            return Outcome(ok=False, output="", error=str(exc))

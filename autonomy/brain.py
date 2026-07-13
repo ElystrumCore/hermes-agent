@@ -41,3 +41,43 @@ class MockBrain:
             idle=False,
             done=done,
         )
+
+
+import json as _json
+import re as _re
+
+_JSON_OBJ = _re.compile(r"\{.*\}", _re.DOTALL)
+_IDLE_FAIL = Decision(target_goal=None, action="", rationale="unparseable brain output", idle=True, done=False)
+
+
+class LiveBrain:
+    """Live brain: a cheap planning call via Hermes _run_agent, fail-closed parse."""
+
+    def __init__(self, model=None) -> None:
+        self._model = model
+
+    def decide(self, soul_render: str, goals, recent) -> Decision:
+        try:
+            from hermes_cli.oneshot import _run_agent
+            goals_txt = "\n".join(f"- {g.id}: {g.text}" for g in goals) or "(none)"
+            recent_txt = "\n".join(getattr(r, "decision", r).action for r in recent[-3:]) or "(none)"
+            prompt = (
+                f"{soul_render}\n\n# Active goals\n{goals_txt}\n\n# Recent actions\n{recent_txt}\n\n"
+                "Decide the single next action toward the top goal. Reply with ONE JSON object only: "
+                '{"target_goal": <id or null>, "action": <string>, "rationale": <string>, '
+                '"idle": <bool>, "done": <bool>}. Set idle=true only if nothing should be done now.'
+            )
+            final_response, _ = _run_agent(prompt, model=self._model)
+            m = _JSON_OBJ.search(final_response or "")
+            if not m:
+                return _IDLE_FAIL
+            data = _json.loads(m.group(0))
+            return Decision(
+                target_goal=data.get("target_goal"),
+                action=str(data.get("action", "")),
+                rationale=str(data.get("rationale", "")),
+                idle=bool(data.get("idle", False)),
+                done=bool(data.get("done", False)),
+            )
+        except Exception:
+            return _IDLE_FAIL
