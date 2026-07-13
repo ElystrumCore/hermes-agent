@@ -50,6 +50,33 @@ _JSON_OBJ = _re.compile(r"\{.*\}", _re.DOTALL)
 _IDLE_FAIL = Decision(target_goal=None, action="", rationale="unparseable brain output", idle=True, done=False)
 
 
+def _strip_think(text: str) -> str:
+    return _re.sub(r"<think>.*?</think>", "", text or "", flags=_re.DOTALL | _re.IGNORECASE)
+
+
+def _extract_json(text):
+    """First COMPLETE balanced {...} object (after stripping <think> blocks), or None."""
+    s = _strip_think(text)
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None
+
+
+def _parse_yes(text: str) -> bool:
+    """True iff the first standalone yes/no in the (think-stripped) text is 'yes'."""
+    m = _re.search(r"\b(yes|no)\b", _strip_think(text).lower())
+    return bool(m) and m.group(1) == "yes"
+
+
 class LiveBrain:
     """Live brain: a cheap planning call via Hermes _run_agent, fail-closed parse."""
 
