@@ -47,7 +47,7 @@ def test_live_brain_fail_closed_on_exception(monkeypatch):
         raise RuntimeError("model down")
     _fake_oneshot(monkeypatch, boom)
     d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
-    assert d.idle is True and "unparseable" in d.rationale
+    assert d.idle is True and "brain call failed" in d.rationale
 
 
 def test_hermes_hands_returns_final_response(monkeypatch):
@@ -70,3 +70,40 @@ def test_live_leg_real_run(tmp_path):
     out = HermesHands().act(Decision("g1", "Reply with the single word: pong.", "", False, False))
     assert isinstance(out, Outcome)
     assert out.ok is True and out.output.strip() != ""
+
+
+def test_live_brain_surfaces_call_error_in_rationale(monkeypatch):
+    def boom(prompt, model=None):
+        raise RuntimeError("model down")
+    _fake_oneshot(monkeypatch, boom)
+    d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
+    assert d.idle is True and "brain call failed" in d.rationale and "model down" in d.rationale
+
+
+def test_live_brain_surfaces_unparseable_in_rationale(monkeypatch):
+    _fake_oneshot(monkeypatch, lambda prompt, model=None: ("no json here", {}))
+    d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
+    assert d.idle is True and "unparseable" in d.rationale
+
+
+def test_live_brain_surfaces_bad_json_in_rationale(monkeypatch):
+    _fake_oneshot(monkeypatch, lambda prompt, model=None: ('{"action": "x", bad}', {}))
+    d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
+    assert d.idle is True and "bad json" in d.rationale
+
+
+def test_live_brain_parses_valid_through_think(monkeypatch):
+    _fake_oneshot(monkeypatch, lambda prompt, model=None: (
+        '<think>plan</think>{"target_goal":"g1","action":"Summarize the files","idle":false,"done":false}', {}))
+    d = LiveBrain().decide("id", [Goal("g1", "A", False)], [])
+    assert d.target_goal == "g1" and d.action == "Summarize the files" and d.idle is False
+
+
+def test_fmt_recent_includes_action_and_result():
+    from autonomy.brain import _fmt_recent
+    from autonomy.hands import Outcome
+    from autonomy.memory import TickRecord
+    rec = TickRecord(tick=1, ts="t", decision=Decision("g1", "did a thing", "", False, False),
+                     outcome=Outcome(ok=True, output="the result"), goal_states={})
+    s = _fmt_recent([rec])
+    assert "did a thing" in s and "the result" in s

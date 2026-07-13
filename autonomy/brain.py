@@ -46,9 +46,6 @@ class MockBrain:
 import json as _json
 import re as _re
 
-_JSON_OBJ = _re.compile(r"\{.*\}", _re.DOTALL)
-_IDLE_FAIL = Decision(target_goal=None, action="", rationale="unparseable brain output", idle=True, done=False)
-
 
 def _strip_think(text: str) -> str:
     return _re.sub(r"<think>.*?</think>", "", text or "", flags=_re.DOTALL | _re.IGNORECASE)
@@ -77,6 +74,17 @@ def _parse_yes(text: str) -> bool:
     return bool(m) and m.group(1) == "yes"
 
 
+def _fmt_recent(recent) -> str:
+    lines = []
+    for r in recent[-3:]:
+        d = getattr(r, "decision", None)
+        o = getattr(r, "outcome", None)
+        act = getattr(d, "action", "") if d is not None else str(r)
+        out = (getattr(o, "output", "") or "")[:120]
+        lines.append(f"- did: {act!r} -> result: {out!r}")
+    return "\n".join(lines) or "(none)"
+
+
 class LiveBrain:
     """Live brain: a cheap planning call via Hermes _run_agent, fail-closed parse."""
 
@@ -86,26 +94,44 @@ class LiveBrain:
     def decide(self, soul_render: str, goals, recent) -> Decision:
         try:
             from hermes_cli.oneshot import _run_agent
-            goals_txt = "\n".join(f"- {g.id}: {g.text}" for g in goals) or "(none)"
-            recent_txt = "\n".join(getattr(r, "decision", r).action for r in recent[-3:]) or "(none)"
-            prompt = (
-                f"{soul_render}\n\n# Active goals\n{goals_txt}\n\n# Recent actions\n{recent_txt}\n\n"
-                "Decide the single next action toward the top goal. Reply with ONE JSON object only: "
-                '{"target_goal": <id or null>, "action": <string>, "rationale": <string>, '
-                '"idle": <bool>, "done": <bool>}. Set idle=true only if nothing should be done now.'
-            )
+        except Exception as exc:  # noqa: BLE001 — surfaced, fail-closed
+            return Decision(target_goal=None, action="", rationale=f"brain call failed: {exc}",
+                            idle=True, done=False)
+        goals_txt = "\n".join(f"- {g.id}: {g.text}" for g in goals) or "(none)"
+        recent_txt = _fmt_recent(recent)
+        prompt = (
+            f"{soul_render}\n\n# Active goals\n{goals_txt}\n\n"
+            f"# Recent actions and results\n{recent_txt}\n\n"
+            "You are driving toward the TOP active goal. Decide the SINGLE next action.\n"
+            '- "action" MUST be a plain natural-language instruction for a general assistant '
+            '(e.g. "Summarize the top-level files and save a note"). NEVER a function or tool name.\n'
+            '- Set "done": true ONLY if the goal\'s deliverable is already achieved — check the most '
+            "recent action result above.\n"
+            '- Set "idle": true only if nothing useful should be done now.\n'
+            "Reply with ONE JSON object only: "
+            '{"target_goal": <id or null>, "action": <string>, "rationale": <string>, '
+            '"idle": <bool>, "done": <bool>}'
+        )
+        try:
             final_response, _ = _run_agent(prompt, model=self._model)
-            m = _JSON_OBJ.search(final_response or "")
-            if not m:
-                return _IDLE_FAIL
-            data = _json.loads(m.group(0))
-            action = str(data.get("action", "")).strip()
-            return Decision(
-                target_goal=data.get("target_goal"),
-                action=action,
-                rationale=str(data.get("rationale", "")),
-                idle=bool(data.get("idle", False)) or not action,
-                done=bool(data.get("done", False)),
-            )
-        except Exception:
-            return _IDLE_FAIL
+        except Exception as exc:  # noqa: BLE001
+            return Decision(target_goal=None, action="", rationale=f"brain call failed: {exc}",
+                            idle=True, done=False)
+        raw = _extract_json(final_response or "")
+        if raw is None:
+            return Decision(target_goal=None, action="",
+                            rationale=f"unparseable brain output: {(final_response or '')[:80]!r}",
+                            idle=True, done=False)
+        try:
+            data = _json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            return Decision(target_goal=None, action="", rationale=f"bad json: {exc}",
+                            idle=True, done=False)
+        action = str(data.get("action", "")).strip()
+        return Decision(
+            target_goal=data.get("target_goal"),
+            action=action,
+            rationale=str(data.get("rationale", "")),
+            idle=bool(data.get("idle", False)) or not action,
+            done=bool(data.get("done", False)),
+        )
