@@ -45,6 +45,8 @@ class Memory:
         return set(self._done)
 
     def no_progress(self, window: int) -> bool:
+        if window < 1:
+            return False
         if len(self._records) < window:
             return False
         last = self._records[-window:]

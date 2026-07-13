@@ -121,3 +121,17 @@ def test_verify_gate_allows_completion_when_verify_true(tmp_path):
     report = loop.run()
     assert set(report.completed) == {"g1", "g2"}
     assert report.terminate_reason == "all goals done"
+
+
+class _IdleBrain:
+    def decide(self, soul_render, goals, recent):
+        return Decision(goals[0].id if goals else None, "", "chose idle", True, False)
+    def verify_done(self, goal_text, output): return True
+
+
+def test_idle_decision_records_idle_outcome_without_acting(tmp_path):
+    # A brain that idles despite active goals -> tick records Outcome(ok=True, output="[idle]"), no act.
+    loop = _loop(tmp_path, brain=_IdleBrain(), hb=Heartbeat(max_ticks=1, no_progress_window=99))
+    rec = loop.tick()
+    assert rec.decision.idle is True and rec.outcome.ok is True and rec.outcome.output == "[idle]"
+    assert loop._action_count == 0                   # no act happened

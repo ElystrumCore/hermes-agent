@@ -59,21 +59,27 @@ def main(argv: Optional[list] = None) -> int:
         print(f"  FAIL {f}")
 
     if args.write_back_goals and report.completed:
-        _write_back(args.goals, soul, report.completed)
+        _write_back(args.goals, report.completed)
     return 0
 
 
-def _write_back(goals_path: str, soul, completed) -> None:
-    """Best-effort: tick the checkbox for completed goals in GOALS.md (opt-in)."""
-    done_texts = {g.text for g in soul.all_goals() if g.id in set(completed)}
+import re as _re
+
+_WB_CHECKLIST = _re.compile(r"^(\s*-\s*\[)([ xX])(\]\s+.*\S\s*)$")
+
+
+def _write_back(goals_path: str, completed) -> None:
+    """Best-effort: tick the checkbox for completed goals BY id/position (dup-text safe)."""
+    completed = set(completed)
     p = Path(goals_path)
-    out = []
+    out, n = [], 0
     for line in p.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- [ ]") and stripped[5:].strip() in done_texts:
-            out.append(line.replace("- [ ]", "- [x]", 1))
-        else:
-            out.append(line)
+        m = _WB_CHECKLIST.match(line)
+        if m:
+            n += 1
+            if f"g{n}" in completed and m.group(2) == " ":
+                line = f"{m.group(1)}x{m.group(3)}"
+        out.append(line)
     p.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 

@@ -46,3 +46,9 @@ def test_no_progress_false_when_a_goal_completed_in_window(tmp_path):
     m.record(_rec(1, "same action", done=False))
     m.record(_rec(2, "same action", done=True))
     assert m.no_progress(window=3) is False
+
+
+def test_no_progress_window_zero_is_false(tmp_path):
+    m = Memory(str(tmp_path))
+    m.record(_rec(0, "same", done=False))
+    assert m.no_progress(window=0) is False
