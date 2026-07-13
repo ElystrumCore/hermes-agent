@@ -107,10 +107,15 @@ class LiveBrain:
             f"{soul_render}\n\n# Active goals\n{goals_txt}\n\n"
             f"# Recent actions and results\n{recent_txt}\n\n"
             "You are driving toward the TOP active goal. Decide the SINGLE next action.\n"
-            '- "action" MUST be a plain natural-language instruction for a general assistant '
-            '(e.g. "Summarize the top-level files and save a note"). NEVER a function or tool name.\n'
+            '- "action" MUST be a plain natural-language instruction that directly accomplishes the TOP '
+            "goal above, phrased for a general assistant, and TAILORED to that goal's exact wording "
+            "(do NOT copy any example verbatim). NEVER a function or tool name. Unrelated example of the "
+            'FORM only: "Check disk usage and report the largest directories."\n'
             '- Set "done": true ONLY if the goal\'s deliverable is already achieved — check the most '
             "recent action result above.\n"
+            "- Look at Recent actions and results: if a prior action ALREADY produced the goal's "
+            'deliverable, set "done": true. Do NOT repeat an action that already ran — if the goal is '
+            "not yet met, take a DIFFERENT next step.\n"
             '- Set "idle": true only if nothing useful should be done now.\n'
             "Reply with ONE JSON object only: "
             '{"target_goal": <id or null>, "action": <string>, "rationale": <string>, '
