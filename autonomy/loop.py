@@ -64,7 +64,10 @@ class AutonomyLoop:
                 self._action_count += 1
                 self.gate.after_act(decision, outcome)
                 if outcome.ok and decision.done and decision.target_goal:
-                    self.memory.mark_done(decision.target_goal)
+                    goal_text = next((g.text for g in self.soul.all_goals()
+                                      if g.id == decision.target_goal), "")
+                    if self.brain.verify_done(goal_text, outcome.output):
+                        self.memory.mark_done(decision.target_goal)
 
         goal_states = {g.id: (g.id in self.memory.completed_goals()) for g in self.soul.all_goals()}
         rec = TickRecord(

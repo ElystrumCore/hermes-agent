@@ -92,3 +92,32 @@ def test_run_calls_heartbeat_wait_once_per_tick(tmp_path):
     loop = _loop(tmp_path, brain=MockBrain(ticks_per_goal=1), hb=hb)
     report = loop.run()
     assert hb.wait_calls == report.ticks
+
+
+from autonomy.brain import Decision
+
+
+class _DoneBrain:
+    """Always proposes done on the top goal; verify_done configurable."""
+    def __init__(self, verify): self._verify = verify
+    def decide(self, soul_render, goals, recent):
+        if not goals:
+            return Decision(None, "", "", True, False)
+        return Decision(goals[0].id, "do it", "top", False, True)
+    def verify_done(self, goal_text, output): return self._verify
+
+
+def test_verify_gate_blocks_completion_when_verify_false(tmp_path):
+    loop = _loop(tmp_path, brain=_DoneBrain(verify=False),
+                 hb=Heartbeat(max_ticks=2, no_progress_window=99))
+    report = loop.run()
+    assert report.completed == []               # proposed done, but verify said no
+    assert report.terminate_reason == "max_ticks"
+
+
+def test_verify_gate_allows_completion_when_verify_true(tmp_path):
+    loop = _loop(tmp_path, brain=_DoneBrain(verify=True),
+                 hb=Heartbeat(max_ticks=20, no_progress_window=99))
+    report = loop.run()
+    assert set(report.completed) == {"g1", "g2"}
+    assert report.terminate_reason == "all goals done"
