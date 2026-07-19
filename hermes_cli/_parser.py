@@ -197,6 +197,18 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--require-plugin",
+        action="append",
+        default=None,
+        metavar="PLUGIN",
+        help=(
+            "Require PLUGIN to load and register a mandatory pre-tool policy "
+            "enforcer; repeat for multiple enforcers. Startup fails closed if "
+            "any requirement is unavailable."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--skills",
         "-s",
         action="append",

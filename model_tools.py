@@ -1193,7 +1193,8 @@ def handle_function_call(
                     middleware_trace=list(_tool_middleware_trace),
                 )
             except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+                logger.error("pre_tool_call enforcement failed closed: %s", _hook_err)
+                block_message = "BLOCKED: pre-tool policy enforcement unavailable"
 
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)

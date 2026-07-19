@@ -463,7 +463,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             except Exception:
-                block_message = None
+                block_message = "BLOCKED: pre-tool policy enforcement unavailable"
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -1126,7 +1126,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             except Exception:
-                pass
+                _block_msg = "BLOCKED: pre-tool policy enforcement unavailable"
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:

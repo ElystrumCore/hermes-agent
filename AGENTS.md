@@ -747,6 +747,11 @@ can:
 - Register Python-callback lifecycle hooks:
   `pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`,
   `on_session_start`, `on_session_end`
+- Register a mandatory pre-tool policy enforcer with
+  `ctx.register_required_hook("pre_tool_call", callback)`. Operators pin it
+  with `plugins.required` or invocation-scoped `--require-plugin`; callbacks
+  must explicitly return `allow`, `approve`, or `block`. Missing/crashed/
+  malformed enforcers fail startup and the tool path fails closed.
 - Register new tools via `ctx.register_tool(...)`
 - Register CLI subcommands via `ctx.register_cli_command(...)` — the
   plugin's argparse tree is wired into `hermes` at startup so
@@ -757,6 +762,13 @@ Hooks are invoked from `model_tools.py` (pre/post tool) and `run_agent.py`
 as a side effect of importing `model_tools.py`. Code paths that read plugin
 state without importing `model_tools.py` first must call `discover_plugins()`
 explicitly (it's idempotent).
+
+Required hooks are not ordinary observers. They run before optional
+`pre_tool_call` hooks; block outranks approval, and optional hooks cannot
+override a mandatory decision. Keep this surface generic—product-specific
+policy belongs in a standalone plugin, not Hermes core. An unexpected failure
+in the central pre-tool dispatcher itself also blocks execution at every
+dispatch path.
 
 ### Memory-provider plugins (`plugins/memory/<name>/`)
 

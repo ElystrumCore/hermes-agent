@@ -593,13 +593,35 @@ def register(ctx):
     ctx.register_hook("on_session_end", on_session_end)
 ```
 
+### Register a mandatory pre-tool enforcer
+
+Use this only for authorization policy that must fail closed:
+
+```python
+def enforce(tool_name, args, toolset, **kwargs):
+    if tool_name == "terminal":
+        return {"action": "approve", "message": "operator confirmation required"}
+    return {"action": "allow"}
+
+def register(ctx):
+    ctx.register_required_hook("pre_tool_call", enforce)
+```
+
+The operator must also list the plugin in both `plugins.enabled` and
+`plugins.required`, or launch with `--require-plugin`. Only `pre_tool_call` is
+supported because it is the last common boundary before a side effect. Every
+callback invocation must return an explicit `allow`, `approve`, or `block`;
+exceptions and malformed/empty results fail closed. The callback also receives
+the registry `toolset`, allowing policy bridges to distinguish a real
+`mcp-<server>` tool from an arbitrary plugin with a lookalike name.
+
 ### Hook reference
 
 Each hook is documented in full on the **[Event Hooks reference](/user-guide/features/hooks#plugin-hooks)** — callback signatures, parameter tables, exactly when each fires, and examples. Here's the summary:
 
 | Hook | Fires when | Callback signature | Returns |
 |------|-----------|-------------------|---------|
-| [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | ignored |
+| [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str, toolset: str` | optional hooks may block/approve; required hooks must decide explicitly |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
 | [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |

@@ -1329,6 +1329,20 @@ display:
 #   redact_pii: false
 
 # =============================================================================
+# Plugins and mandatory policy enforcers
+# =============================================================================
+# General plugins remain opt-in through `enabled`. `required` is an additive
+# fail-closed floor for plugins that register a mandatory pre-tool policy hook:
+# Hermes refuses to start an agent turn if one is missing, disabled, crashes
+# during load, or fails to register that hook. An invocation may raise the floor
+# further with `hermes --require-plugin <name> chat ...`; it cannot lower this
+# configured list.
+plugins:
+  enabled: []
+  required: []
+  entries: {}
+
+# =============================================================================
 # Shell-script hooks
 # =============================================================================
 # Register shell scripts as plugin-hook callbacks.  Each entry is executed as

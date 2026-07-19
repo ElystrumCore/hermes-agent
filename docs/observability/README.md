@@ -58,6 +58,26 @@ behavior-affecting hooks:
 Telemetry plugins should treat these behavior-affecting returns as optional
 compatibility features, not as observability requirements.
 
+### Mandatory policy hooks
+
+Ordinary callbacks registered with `register_hook` remain fail-open observers.
+A policy plugin can instead use `register_required_hook` at the four boundaries
+where Hermes can still prevent ungoverned work:
+
+| Hook | Fail-closed boundary |
+| --- | --- |
+| `pre_tool_call` | Before tool dispatch. |
+| `pre_api_request` | Before provider I/O or model spend. |
+| `post_api_request` | After usage is known, before the response can advance to tool execution. |
+| `pre_run_start` | Before cron claims/executes a job or kanban creates a worker process. |
+
+Required callbacks must return an explicit `allow`, `approve`, or `block`
+directive. A missing callback, exception, malformed result, unavailable plugin,
+or conflict between returned run/session bindings blocks the operation. Configure
+the plugin under `plugins.required` and use `--require-plugin <name>` when the
+launch itself must abort unless that plugin loaded. `post_run_end` is the
+fail-open completion observer paired with scheduled-run admission.
+
 ## Correlation IDs
 
 Observer payloads use stable IDs so plugins can join events without relying on

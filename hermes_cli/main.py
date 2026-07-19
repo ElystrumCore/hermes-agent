@@ -415,6 +415,7 @@ def _apply_profile_override() -> None:
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--require-plugin",
     }
     optional_value_flags = {"-c", "--continue"}
     i = 0
@@ -12739,6 +12740,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--require-plugin",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
@@ -12843,6 +12845,25 @@ def _prepare_agent_startup(args) -> None:
     # (#60328).
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+
+    invocation_required = getattr(args, "require_plugin", None) or []
+    if invocation_required:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in invocation_required
+        ):
+            print(
+                "Error: --require-plugin expects a non-empty plugin name",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        inherited = {
+            value.strip()
+            for value in os.environ.get("HERMES_REQUIRED_PLUGINS", "").split(",")
+            if value.strip()
+        }
+        inherited.update(str(value).strip() for value in invocation_required)
+        os.environ["HERMES_REQUIRED_PLUGINS"] = ",".join(sorted(inherited))
     _apply_safe_mode(args)
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
@@ -12854,9 +12875,16 @@ def _prepare_agent_startup(args) -> None:
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
     try:
-        from hermes_cli.plugins import discover_plugins
+        from hermes_cli.plugins import RequiredPluginError, discover_plugins
 
         discover_plugins()
+    except RequiredPluginError as exc:
+        logger.critical("mandatory plugin enforcement unavailable: %s", exc)
+        print(
+            f"Error: mandatory plugin enforcement unavailable: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
     except Exception:
         logger.warning(
             "plugin discovery failed at CLI startup",

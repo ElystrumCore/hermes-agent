@@ -2657,7 +2657,9 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2907,7 +2909,9 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = job.get("_agent_lineage_session_id") or (
+        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3718,10 +3722,35 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    _governed_session_id = (
+        f"cron_{job.get('id', 'unknown')}_{_hermes_now().strftime('%Y%m%d_%H%M%S_%f')}"
+    )
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
     try:
+        from hermes_cli.plugins import get_required_hook_directive
+
+        _run_directive = get_required_hook_directive(
+            "pre_run_start",
+            run_kind="cron",
+            external_id=str(job.get("id") or ""),
+            session_id=_governed_session_id,
+            metadata={
+                "no_agent": bool(job.get("no_agent")),
+                "schedule": str(job.get("schedule") or "")[:256],
+            },
+        )
+        if _run_directive.get("action") != "allow":
+            reason = str(
+                _run_directive.get("message")
+                or "mandatory policy enforcer denied cron dispatch"
+            )
+            logger.error("Job '%s' blocked before dispatch: %s", job.get("id"), reason)
+            mark_job_run(str(job.get("id") or ""), False, reason)
+            finish_execution(execution_id, success=False, error=reason)
+            return False
+
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
@@ -3770,8 +3799,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            _governed_job = dict(job)
+            _governed_job["_agent_lineage_session_id"] = _governed_session_id
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                _governed_job, defer_agent_teardown=_deferred_agents
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -3852,6 +3883,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         finish_execution(execution_id, success=success, error=error)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "post_run_end",
+                run_kind="cron",
+                external_id=str(job.get("id") or ""),
+                session_id=_governed_session_id,
+                status="success" if success else "failed",
+            )
+        except Exception:
+            logger.warning("Job '%s': post-run policy observer failed", job.get("id"))
         return True
 
     except Exception as e:
@@ -3859,6 +3901,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "post_run_end",
+                run_kind="cron",
+                external_id=str(job.get("id") or ""),
+                session_id=_governed_session_id,
+                status="failed",
+            )
+        except Exception:
+            logger.warning("Job '%s': post-run policy observer failed", job.get("id"))
         return False
 
 
