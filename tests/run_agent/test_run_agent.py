@@ -4045,6 +4045,48 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
+    def test_required_pre_api_hook_blocks_before_provider_spend(self, agent):
+        self._setup_agent(agent)
+        with (
+            patch(
+                "hermes_cli.plugins.get_required_hook_directive",
+                return_value={"action": "block", "message": "model budget exhausted"},
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do not spend")
+
+        assert result["failed"] is True
+        assert "model budget exhausted" in result["final_response"]
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_required_post_api_hook_blocks_unmetered_response(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="provider response", finish_reason="stop"
+        )
+
+        def _required(name, **kwargs):
+            if name == "post_api_request":
+                return {"action": "block", "message": "usage settlement failed"}
+            return {"action": "allow"}
+
+        with (
+            patch(
+                "hermes_cli.plugins.get_required_hook_directive",
+                side_effect=_required,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("meter this")
+
+        assert result["failed"] is True
+        assert "usage settlement failed" in result["final_response"]
+
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False

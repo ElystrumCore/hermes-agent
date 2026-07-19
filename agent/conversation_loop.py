@@ -494,6 +494,23 @@ def _content_policy_blocked_result(
     }
 
 
+def _required_policy_blocked_result(
+    messages: List[Dict],
+    api_call_count: int,
+    message: str,
+) -> Dict[str, Any]:
+    """Build a terminal result when a mandatory control-plane hook denies."""
+    public_message = message or "BLOCKED: mandatory policy enforcer denied the operation"
+    return {
+        "final_response": public_message,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "error": f"required_policy_blocked: {public_message}",
+    }
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -1196,9 +1213,33 @@ def run_conversation(
 
                 try:
                     from hermes_cli.plugins import (
+                        get_required_hook_directive,
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
+                    _required_api = get_required_hook_directive(
+                        "pre_api_request",
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        retry_count=retry_count,
+                        approx_input_tokens=approx_tokens,
+                        message_count=len(api_messages),
+                        tool_count=len(agent.tools or []),
+                    )
+                    if _required_api.get("action") != "allow":
+                        return _required_policy_blocked_result(
+                            messages,
+                            api_call_count,
+                            str(_required_api.get("message") or ""),
+                        )
                     if has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
@@ -1248,8 +1289,12 @@ def run_conversation(
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    return _required_policy_blocked_result(
+                        messages,
+                        api_call_count,
+                        f"BLOCKED: pre-model policy enforcement unavailable ({type(exc).__name__})",
+                    )
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -1331,6 +1376,7 @@ def run_conversation(
                     base_url=agent.base_url,
                     api_mode=agent.api_mode,
                     api_call_count=api_call_count,
+                    retry_count=retry_count,
                     middleware_trace=list(_llm_middleware_trace),
                 )
                 
@@ -4253,17 +4299,45 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            _assistant_tool_calls = (
+                getattr(assistant_message, "tool_calls", None) or []
+            )
+            _assistant_text = assistant_message.content or ""
+            _api_ended_at = api_start_time + api_duration
+            _usage_summary = agent._usage_summary_for_api_request_hook(response)
             try:
-                from hermes_cli.plugins import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
+                from hermes_cli.plugins import get_required_hook_directive
+                _required_usage = get_required_hook_directive(
+                    "post_api_request",
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    session_id=agent.session_id or "",
+                    platform=agent.platform or "",
+                    model=agent.model,
+                    provider=agent.provider,
+                    api_call_count=api_call_count,
+                    retry_count=retry_count,
+                    usage=_usage_summary,
                 )
+            except Exception as exc:
+                _required_usage = {
+                    "action": "block",
+                    "message": (
+                        "BLOCKED: model-usage policy enforcement unavailable "
+                        f"({type(exc).__name__})"
+                    ),
+                }
+            if _required_usage.get("action") != "allow":
+                return _required_policy_blocked_result(
+                    messages,
+                    api_call_count,
+                    str(_required_usage.get("message") or ""),
+                )
+
+            try:
+                from hermes_cli.plugins import has_hook, invoke_hook as _invoke_hook
                 if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
-                    )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
                     _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
@@ -4287,7 +4361,7 @@ def run_conversation(
                             assistant_message,
                             finish_reason=finish_reason,
                         ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
+                        usage=_usage_summary,
                         assistant_message=assistant_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),

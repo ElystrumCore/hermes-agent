@@ -162,6 +162,10 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Mandatory scheduler admission before cron executes or kanban spawns,
+    # plus an observer emitted after an admitted run finishes.
+    "pre_run_start",
+    "post_run_end",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1231,19 +1235,25 @@ class PluginContext:
     def register_required_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a mandatory behavior-changing policy hook.
 
-        Required hooks are intentionally limited to ``pre_tool_call``: that is
-        the boundary where Hermes can still prevent an action. The callback
-        must return an explicit ``allow``, ``approve``, or ``block`` directive
-        for every call. Exceptions and malformed/empty returns fail closed.
+        Required hooks are limited to boundaries where Hermes can prevent
+        spend or stop the response from advancing: tool calls, model request
+        reservation/settlement, and scheduler-owned run admission. The
+        callback must return an explicit ``allow``, ``approve``, or ``block``
+        directive. Exceptions and malformed/empty returns fail closed.
 
         Operators make the plugin itself mandatory with
         ``plugins.required: [<plugin-id>]``. A required plugin that is missing,
         disabled, fails to load, or registers no required hook aborts discovery;
         the pre-tool path independently blocks as a second line of defense.
         """
-        if hook_name != "pre_tool_call":
+        if hook_name not in {
+            "pre_tool_call",
+            "pre_api_request",
+            "post_api_request",
+            "pre_run_start",
+        }:
             raise ValueError(
-                "required hooks currently support only 'pre_tool_call'"
+                "required hook is not an enforceable Hermes boundary"
             )
         if not callable(callback):
             raise TypeError("required hook callback must be callable")
@@ -2133,6 +2143,7 @@ class PluginManager:
             return []
 
         approval: dict[str, Any] | None = None
+        context: dict[str, str] = {}
         for plugin_id, callback in active_callbacks:
             try:
                 result = callback(**kwargs)
@@ -2159,11 +2170,24 @@ class PluginManager:
                 return [{
                     "action": "block",
                     "message": message if isinstance(message, str) and message else
-                               "BLOCKED: required policy enforcer denied this tool",
+                               "BLOCKED: required policy enforcer denied this operation",
                 }]
+            for key in ("run_id", "session_id"):
+                value = result.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                prior = context.get(key)
+                if prior is not None and prior != value:
+                    return [{
+                        "action": "block",
+                        "message": "BLOCKED: required policy enforcers returned conflicting run context",
+                    }]
+                context[key] = value
             if result["action"] == "approve" and approval is None:
                 approval = result
-        return [approval or {"action": "allow"}]
+        directive = dict(approval or {"action": "allow"})
+        directive.update(context)
+        return [directive]
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2291,6 +2315,27 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_required_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke mandatory policy callbacks with fail-closed aggregation."""
+    return get_plugin_manager().invoke_required_hook(hook_name, **kwargs)
+
+
+def get_required_hook_directive(hook_name: str, **kwargs: Any) -> Dict[str, Any]:
+    """Return one normalized mandatory directive for a non-tool call site."""
+    results = invoke_required_hook(hook_name, **kwargs)
+    if not results:
+        return {"action": "allow"}
+    result = results[0]
+    if not isinstance(result, dict) or result.get("action") not in {
+        "allow", "approve", "block",
+    }:
+        return {
+            "action": "block",
+            "message": "BLOCKED: required policy enforcer returned an invalid result",
+        }
+    return dict(result)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

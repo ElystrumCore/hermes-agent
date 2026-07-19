@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -60,8 +62,17 @@ agent:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import plugins as plugin_runtime
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        plugin_runtime,
+        "get_required_hook_directive",
+        lambda *args, **kwargs: {
+            "action": "allow",
+            "run_id": "run.hermes.kanban.test",
+        },
+    )
 
     captured = {}
 
@@ -83,10 +94,37 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["AGENT_LINEAGE_RUN_ID"] == "run.hermes.kanban.test"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
+
+
+def test_default_spawn_honors_required_policy_before_process_creation(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import plugins as plugin_runtime
+
+    monkeypatch.setattr(
+        plugin_runtime,
+        "get_required_hook_directive",
+        lambda *args, **kwargs: {
+            "action": "block",
+            "message": "subagent budget exhausted",
+        },
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("policy denial must precede Popen"),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="subagent budget exhausted"):
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

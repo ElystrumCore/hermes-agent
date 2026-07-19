@@ -4810,3 +4810,21 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert "a@example.com" in result
         assert "b@example.com" in result
         assert mock_pool.submit.call_count == 2
+
+
+def test_required_policy_denies_cron_before_claim_or_execution():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "governed-job", "name": "governed", "deliver": "local"}
+    with patch(
+        "hermes_cli.plugins.get_required_hook_directive",
+        return_value={"action": "block", "message": "budget exhausted"},
+    ), patch("cron.scheduler.claim_dispatch") as claim, patch(
+        "cron.scheduler.run_job"
+    ) as execute, patch("cron.scheduler.mark_job_run") as mark:
+        assert run_one_job(job) is False
+
+    claim.assert_not_called()
+    execute.assert_not_called()
+    mark.assert_called_once()
+    assert "budget exhausted" in str(mark.call_args)

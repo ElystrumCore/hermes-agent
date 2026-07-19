@@ -7768,6 +7768,42 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Scheduler-owned worker creation happens outside the model tool registry.
+    # Give mandatory policy plugins a final admission point before Popen and
+    # carry the returned durable run binding into the child process.
+    from hermes_cli.plugins import get_required_hook_directive
+
+    _governed_session_id = (
+        f"kanban_{resolved_board}_{task.id}_{task.current_run_id or 'unbound'}"
+    )[:256]
+    _run_directive = get_required_hook_directive(
+        "pre_run_start",
+        run_kind="kanban",
+        external_id=(
+            f"{resolved_board}:{task.id}:{task.current_run_id or 'unbound'}"
+        ),
+        session_id=_governed_session_id,
+        metadata={
+            "assignee": profile_arg,
+            "role": "leaf",
+            "workspace_bound": bool(workspace),
+        },
+    )
+    if _run_directive.get("action") != "allow":
+        raise RuntimeError(
+            str(
+                _run_directive.get("message")
+                or "mandatory policy enforcer denied kanban worker dispatch"
+            )
+        )
+    _lineage_run_id = _run_directive.get("run_id")
+    if _lineage_run_id is not None:
+        if not isinstance(_lineage_run_id, str) or not re.fullmatch(
+            r"[a-z0-9][a-z0-9._:-]{2,127}", _lineage_run_id
+        ):
+            raise RuntimeError("mandatory policy enforcer returned an invalid run binding")
+        env["AGENT_LINEAGE_RUN_ID"] = _lineage_run_id
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,

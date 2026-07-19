@@ -14,6 +14,7 @@ from hermes_cli.plugins import (
     PluginManager,
     PluginManifest,
     RequiredPluginError,
+    get_required_hook_directive,
     get_pre_tool_call_directive,
 )
 from hermes_cli._parser import build_top_level_parser
@@ -315,3 +316,69 @@ def test_required_hook_receives_registry_toolset_provenance(tmp_path, monkeypatc
     monkeypatch.setattr(registry, "get_toolset_for_tool", lambda _name: "mcp-example")
     assert get_pre_tool_call_directive("mcp__Example__Lookup", {}) == (None, None)
     assert observed["toolset"] == "mcp-example"
+
+
+def test_required_model_and_run_boundaries_are_supported(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _write_config(home, required=["guard"])
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    context = PluginContext(
+        PluginManifest(name="guard", key="guard", source="user"), manager
+    )
+    for hook_name in ("pre_api_request", "post_api_request", "pre_run_start"):
+        context.register_required_hook(
+            hook_name,
+            lambda _hook=hook_name, **kw: {
+                "action": "allow",
+                **(
+                    {"run_id": "run.hermes.test", "session_id": "session.test"}
+                    if _hook == "pre_run_start"
+                    else {}
+                ),
+            },
+        )
+    # Required plugins remain load-bearing tool enforcers too.
+    context.register_required_hook(
+        "pre_tool_call", lambda **kw: {"action": "allow"}
+    )
+    manager._plugins["guard"] = plugins_module.LoadedPlugin(
+        context.manifest, enabled=True
+    )
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+    assert get_required_hook_directive(
+        "pre_api_request", api_request_id="request.1"
+    ) == {"action": "allow"}
+    assert get_required_hook_directive(
+        "pre_run_start", run_kind="kanban", external_id="task.1"
+    ) == {
+        "action": "allow",
+        "run_id": "run.hermes.test",
+        "session_id": "session.test",
+    }
+
+
+def test_conflicting_required_run_bindings_fail_closed(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _write_config(home, required=["first", "second"])
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    for name, run_id in (("first", "run.first"), ("second", "run.second")):
+        context = PluginContext(
+            PluginManifest(name=name, key=name, source="user"), manager
+        )
+        context.register_required_hook(
+            "pre_run_start",
+            lambda _run_id=run_id, **kw: {"action": "allow", "run_id": _run_id},
+        )
+        manager._plugins[name] = plugins_module.LoadedPlugin(
+            context.manifest, enabled=True
+        )
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+    directive = get_required_hook_directive(
+        "pre_run_start", run_kind="kanban", external_id="task.1"
+    )
+    assert directive["action"] == "block"
+    assert "conflicting run context" in directive["message"]
