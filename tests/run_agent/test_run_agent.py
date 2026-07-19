@@ -2999,6 +2999,23 @@ class TestConcurrentToolExecution:
         assert json.loads(result) == {"error": "Blocked by test policy"}
         mock_todo.assert_not_called()
 
+    def test_invoke_tool_policy_dispatch_error_fails_closed(self, agent, monkeypatch):
+        """An unexpected failure around mandatory hooks must never execute the tool."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("dispatcher down")),
+        )
+        with patch(
+            "tools.todo_tool.todo_tool",
+            side_effect=AssertionError("should not run"),
+        ) as mock_todo:
+            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
+
+        assert json.loads(result) == {
+            "error": "BLOCKED: pre-tool policy enforcement unavailable"
+        }
+        mock_todo.assert_not_called()
+
     def test_invoke_tool_blocked_skips_handle_function_call(self, agent, monkeypatch):
         """Blocked registry tools should not reach handle_function_call."""
         monkeypatch.setattr(

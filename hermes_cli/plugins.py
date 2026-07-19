@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -74,6 +75,10 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class RequiredPluginError(RuntimeError):
+    """A plugin configured as a mandatory policy enforcer is unavailable."""
 
 
 logger = logging.getLogger(__name__)
@@ -268,6 +273,58 @@ def _get_enabled_plugins() -> Optional[set]:
         return None
 
 
+def _get_required_plugins() -> set[str]:
+    """Read the operator's mandatory policy-enforcer list.
+
+    Unlike optional plugin settings, a present-but-malformed ``plugins.required``
+    value is an error. Silently treating it as empty would turn a config typo
+    into an authorization bypass.
+    """
+    try:
+        from hermes_cli.config import load_config, read_raw_config
+
+        configured: set[str] = set()
+        # ``load_config`` supplies managed overlays and normal deep-merge
+        # behavior. Read the raw file as a second source only when a
+        # troubleshooting flag is actively ignoring it; the normal hot path
+        # stays on load_config's mtime cache.
+        configs = [load_config()]
+        if env_var_enabled("HERMES_IGNORE_USER_CONFIG"):
+            configs.append(read_raw_config())
+        for config in configs:
+            plugins_cfg = config.get("plugins") if isinstance(config, dict) else None
+            if not isinstance(plugins_cfg, dict) or "required" not in plugins_cfg:
+                continue
+            required = plugins_cfg.get("required")
+            if not isinstance(required, list) or any(
+                not isinstance(value, str) or not value.strip() for value in required
+            ):
+                raise RequiredPluginError(
+                    "plugins.required must be a list of non-empty plugin names"
+                )
+            configured.update(value.strip() for value in required)
+
+        # Invocation-scoped requirements are set by the generic
+        # ``--require-plugin`` CLI flag.  They are additive: a caller can raise
+        # the configured floor, never remove an operator-pinned enforcer.
+        required_env = os.environ.get("HERMES_REQUIRED_PLUGINS", "").strip()
+        invoked = {
+            value.strip() for value in required_env.split(",") if value.strip()
+        }
+        valid_id = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+        if any(not valid_id.fullmatch(value) for value in invoked):
+            raise RequiredPluginError(
+                "HERMES_REQUIRED_PLUGINS contains an invalid plugin name"
+            )
+        return configured | invoked
+    except RequiredPluginError:
+        raise
+    except Exception as exc:
+        raise RequiredPluginError(
+            "could not read plugins.required; mandatory enforcement state is unknown"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -320,6 +377,7 @@ class LoadedPlugin:
     module: Optional[types.ModuleType] = None
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
+    required_hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
@@ -1170,6 +1228,35 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_required_hook(self, hook_name: str, callback: Callable) -> None:
+        """Register a mandatory behavior-changing policy hook.
+
+        Required hooks are intentionally limited to ``pre_tool_call``: that is
+        the boundary where Hermes can still prevent an action. The callback
+        must return an explicit ``allow``, ``approve``, or ``block`` directive
+        for every call. Exceptions and malformed/empty returns fail closed.
+
+        Operators make the plugin itself mandatory with
+        ``plugins.required: [<plugin-id>]``. A required plugin that is missing,
+        disabled, fails to load, or registers no required hook aborts discovery;
+        the pre-tool path independently blocks as a second line of defense.
+        """
+        if hook_name != "pre_tool_call":
+            raise ValueError(
+                "required hooks currently support only 'pre_tool_call'"
+            )
+        if not callable(callback):
+            raise TypeError("required hook callback must be callable")
+        plugin_id = self.manifest.key or self.manifest.name
+        self._manager._required_hooks.setdefault(hook_name, []).append(
+            (plugin_id, callback)
+        )
+        logger.debug(
+            "Plugin %s registered required hook: %s",
+            self.manifest.name,
+            hook_name,
+        )
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
@@ -1249,6 +1336,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._required_hooks: Dict[str, List[tuple[str, Callable]]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -1282,14 +1370,29 @@ class PluginManager:
         sessions without requiring a full agent restart.
         """
         if self._discovered and not force:
+            required = _get_required_plugins()
+            if env_var_enabled("HERMES_SAFE_MODE") and required:
+                raise RequiredPluginError(
+                    "HERMES_SAFE_MODE disables plugins but plugins.required is non-empty"
+                )
+            # Requirements can be raised by an invocation after another import
+            # already triggered lazy discovery. Revalidate the loaded state;
+            # an early discovery must never downgrade --require-plugin into a
+            # tool-time-only check.
+            self._validate_required_plugins(required)
             return
         if env_var_enabled("HERMES_SAFE_MODE"):
+            if _get_required_plugins():
+                raise RequiredPluginError(
+                    "HERMES_SAFE_MODE disables plugins but plugins.required is non-empty"
+                )
             logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
             self._discovered = True
             return
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._required_hooks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -1315,6 +1418,7 @@ class PluginManager:
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
+        required = _get_required_plugins()
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
         #
@@ -1466,12 +1570,52 @@ class PluginManager:
                 continue
             self._load_plugin(manifest)
 
+        self._validate_required_plugins(required)
+
         if manifests:
             logger.info(
                 "Plugin discovery complete: %d found, %d enabled",
                 len(self._plugins),
                 sum(1 for p in self._plugins.values() if p.enabled),
             )
+
+    def _validate_required_plugins(self, required: Set[str]) -> None:
+        """Fail startup when any configured mandatory enforcer is ineffective."""
+        for required_name in sorted(required):
+            direct = self._plugins.get(required_name)
+            named = [
+                (key, loaded)
+                for key, loaded in self._plugins.items()
+                if loaded.manifest.name == required_name
+            ]
+            if direct is not None:
+                key, loaded = required_name, direct
+            elif len(named) == 1:
+                key, loaded = named[0]
+            elif len(named) > 1:
+                raise RequiredPluginError(
+                    f"required plugin name {required_name!r} is ambiguous; "
+                    "configure its path-derived plugin key"
+                )
+            else:
+                raise RequiredPluginError(
+                    f"required plugin {required_name!r} was not discovered"
+                )
+            if not loaded.enabled or loaded.error:
+                detail = loaded.error or "plugin disabled"
+                raise RequiredPluginError(
+                    f"required plugin {required_name!r} is unavailable: {detail}"
+                )
+            registered = {
+                plugin_id
+                for plugin_id, _callback in self._required_hooks.get(
+                    "pre_tool_call", []
+                )
+            }
+            if key not in registered and loaded.manifest.name not in registered:
+                raise RequiredPluginError(
+                    f"required plugin {required_name!r} registered no required pre_tool_call hook"
+                )
 
     # -----------------------------------------------------------------------
     # Directory scanning
@@ -1784,6 +1928,9 @@ class PluginManager:
                 _hook_counts_before = {
                     h: len(cbs) for h, cbs in self._hooks.items()
                 }
+                _required_hook_counts_before = {
+                    h: len(cbs) for h, cbs in self._required_hooks.items()
+                }
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
@@ -1796,6 +1943,11 @@ class PluginManager:
                     h
                     for h, cbs in self._hooks.items()
                     if len(cbs) > _hook_counts_before.get(h, 0)
+                ]
+                loaded.required_hooks_registered = [
+                    h
+                    for h, cbs in self._required_hooks.items()
+                    if len(cbs) > _required_hook_counts_before.get(h, 0)
                 ]
                 loaded.middleware_registered = [
                     kind
@@ -1923,6 +2075,95 @@ class PluginManager:
                     exc,
                 )
         return results
+
+    def invoke_required_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke mandatory enforcers and aggregate with deny precedence.
+
+        Every configured required plugin must have registered a callback, and
+        every callback must explicitly return one of ``allow``, ``approve``, or
+        ``block``. Any absence, exception, or malformed result becomes a block
+        directive. Callbacks are evaluated in registration order; a ``block``
+        terminates evaluation, otherwise ``approve`` outranks unanimous
+        ``allow``.
+        """
+        try:
+            required = _get_required_plugins()
+        except RequiredPluginError:
+            return [{
+                "action": "block",
+                "message": "BLOCKED: mandatory policy-enforcer configuration is invalid",
+            }]
+        callbacks = self._required_hooks.get(hook_name, [])
+        active_callbacks: List[tuple[str, Callable]] = []
+        registered: Set[str] = set()
+        for plugin_id, callback in callbacks:
+            loaded = self._plugins.get(plugin_id)
+            if loaded is None:
+                named = [
+                    candidate
+                    for candidate in self._plugins.values()
+                    if candidate.manifest.name == plugin_id
+                ]
+                loaded = named[0] if len(named) == 1 else None
+            if loaded is None or not loaded.enabled or loaded.error:
+                continue
+            active_callbacks.append((plugin_id, callback))
+            registered.add(plugin_id)
+            registered.add(loaded.manifest.name)
+
+        for required_name in sorted(required):
+            direct = self._plugins.get(required_name)
+            named = [
+                loaded
+                for loaded in self._plugins.values()
+                if loaded.manifest.name == required_name
+            ]
+            loaded = direct if direct is not None else named[0] if len(named) == 1 else None
+            if (
+                loaded is None
+                or not loaded.enabled
+                or bool(loaded.error)
+                or required_name not in registered
+            ):
+                return [{
+                    "action": "block",
+                    "message": "BLOCKED: required policy enforcer is unavailable",
+                }]
+        if not active_callbacks:
+            return []
+
+        approval: dict[str, Any] | None = None
+        for plugin_id, callback in active_callbacks:
+            try:
+                result = callback(**kwargs)
+            except Exception as exc:
+                logger.error(
+                    "Required hook '%s' from plugin %s failed closed: %s",
+                    hook_name,
+                    plugin_id,
+                    exc,
+                )
+                return [{
+                    "action": "block",
+                    "message": "BLOCKED: required policy enforcer failed",
+                }]
+            if not isinstance(result, dict) or result.get("action") not in {
+                "allow", "approve", "block",
+            }:
+                return [{
+                    "action": "block",
+                    "message": "BLOCKED: required policy enforcer returned no valid decision",
+                }]
+            if result["action"] == "block":
+                message = result.get("message")
+                return [{
+                    "action": "block",
+                    "message": message if isinstance(message, str) and message else
+                               "BLOCKED: required policy enforcer denied this tool",
+                }]
+            if result["action"] == "approve" and approval is None:
+                approval = result
+        return [approval or {"action": "allow"}]
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2140,8 +2381,7 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    hook_results = invoke_hook(
-        "pre_tool_call",
+    hook_kwargs = dict(
         tool_name=tool_name,
         args=args if isinstance(args, dict) else {},
         task_id=task_id,
@@ -2150,6 +2390,56 @@ def _get_pre_tool_call_directive_details(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+    )
+    try:
+        from tools.registry import registry as _tool_registry
+
+        hook_kwargs["toolset"] = _tool_registry.get_toolset_for_tool(tool_name) or ""
+    except Exception:
+        # Required enforcers receive an empty provenance field and decide
+        # fail-closed themselves. Plugin discovery must not depend on the tool
+        # registry being fully initialized yet.
+        hook_kwargs["toolset"] = ""
+    required_results = get_plugin_manager().invoke_required_hook(
+        "pre_tool_call", **hook_kwargs
+    )
+    required_approval: _PreToolCallDirective | None = None
+    for result in required_results:
+        if not isinstance(result, dict):
+            # ``invoke_required_hook`` itself guarantees a block on malformed
+            # callbacks. This is a final defense if a custom manager violates
+            # that contract.
+            return _PreToolCallDirective(
+                action="block",
+                message="BLOCKED: required policy enforcer returned an invalid result",
+            )
+        action = result.get("action")
+        if action == "allow":
+            continue
+        message = result.get("message")
+        message = message if isinstance(message, str) and message else None
+        if action == "block":
+            return _PreToolCallDirective(
+                action="block",
+                message=message or "BLOCKED: required policy enforcer denied this tool",
+            )
+        if action == "approve":
+            rule_key = result.get("rule_key")
+            rule_key = rule_key.strip() if isinstance(rule_key, str) else None
+            required_approval = _PreToolCallDirective(
+                action="approve",
+                message=message,
+                rule_key=rule_key or None,
+            )
+            continue
+        return _PreToolCallDirective(
+            action="block",
+            message="BLOCKED: required policy enforcer returned no valid decision",
+        )
+
+    hook_results = invoke_hook(
+        "pre_tool_call",
+        **hook_kwargs,
     )
 
     for result in hook_results:
@@ -2170,7 +2460,7 @@ def _get_pre_tool_call_directive_details(
             rule_key = None
         return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
 
-    return _PreToolCallDirective()
+    return required_approval or _PreToolCallDirective()
 
 
 def get_pre_tool_call_directive(

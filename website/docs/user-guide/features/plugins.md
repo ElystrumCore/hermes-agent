@@ -151,9 +151,24 @@ plugins:
   enabled:
     - my-tool-plugin
     - disk-cleanup
+  required:       # optional fail-closed policy-enforcer floor
+    - policy-enforcer
   disabled:       # optional deny-list — always wins if a name appears in both
     - noisy-plugin
 ```
+
+`plugins.required` is for mandatory pre-tool policy enforcers, not ordinary
+plugins. Every required name must also be enabled, load successfully, and call
+`ctx.register_required_hook("pre_tool_call", callback)`. Otherwise Hermes
+aborts agent startup. The callback must explicitly return `{"action":
+"allow"}`, `approve`, or `block` for every call; exceptions and malformed or
+empty results block execution. A block outranks approval, and an optional hook
+cannot override it.
+
+An orchestrator can add an invocation-scoped requirement with
+`hermes --require-plugin <name> chat ...`. This adds to the configured list; it
+never removes configured requirements. Safe mode cannot silently disable a
+required enforcer—it fails startup instead.
 
 Three ways to flip state:
 
@@ -223,6 +238,7 @@ The table above shows the four plugin categories, but within "General plugins" t
 |---|---|---|
 | A **tool** the LLM can call | Python plugin — `ctx.register_tool()` | [Build a Hermes Plugin](/developer-guide/plugins) · [Adding Tools](/developer-guide/adding-tools) |
 | A **lifecycle hook** (pre/post LLM, session start/end, tool filter) | Python plugin — `ctx.register_hook()` | [Hooks reference](/user-guide/features/hooks) · [Build a Hermes Plugin](/developer-guide/plugins) |
+| A **mandatory pre-tool policy enforcer** | Python plugin — `ctx.register_required_hook()` plus operator `plugins.required` | [Hooks reference](/user-guide/features/hooks#mandatory-pre-tool-enforcers) · [Build a Hermes Plugin](/developer-guide/plugins) |
 | A **slash command** for the CLI / gateway | Python plugin — `ctx.register_command()` | [Build a Hermes Plugin](/developer-guide/plugins) · [Extending the CLI](/developer-guide/extending-the-cli) |
 | A **subcommand** for `hermes <thing>` | Python plugin — `ctx.register_cli_command()` | [Extending the CLI](/developer-guide/extending-the-cli) |
 | A bundled **skill** that your plugin ships | Python plugin — `ctx.register_skill()` | [Creating Skills](/developer-guide/creating-skills) |

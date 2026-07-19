@@ -2142,7 +2142,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
-            block_message = None
+            block_message = "BLOCKED: pre-tool policy enforcement unavailable"
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:

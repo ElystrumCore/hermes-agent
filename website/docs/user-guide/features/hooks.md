@@ -426,6 +426,25 @@ The agent short-circuits the tool with `message` as the error returned to the mo
 
 **Use cases:** Logging, audit trails, tool call counters, blocking dangerous operations, rate limiting, per-user policy enforcement.
 
+### Mandatory pre-tool enforcers
+
+Ordinary hooks are optional extensions: their exceptions are logged and skipped.
+Authorization systems that must not disappear on error should instead register:
+
+```python
+ctx.register_required_hook("pre_tool_call", callback)
+```
+
+and be pinned by the operator under `plugins.required` (or with
+`--require-plugin`). Required callbacks receive the same fields plus `toolset`
+and must return an explicit `allow`, `approve`, or `block` dict for every call.
+All required callbacks run under deny precedence: any block wins, otherwise an
+approval wins, otherwise every callback must allow. Missing callbacks,
+exceptions, timeouts surfaced by the plugin, and malformed results block the
+tool. Required discovery failures abort agent startup rather than becoming a
+warning. An unexpected failure in the central pre-tool dispatcher also blocks
+execution rather than bypassing the hook.
+
 **Example — tool call audit log:**
 
 ```python
