@@ -25,15 +25,11 @@ Design:
 
 import json
 import logging
-import os
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
-
-from utils import atomic_replace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -758,34 +754,24 @@ class MemoryStore:
 
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
-        """Write entries to a memory file using atomic temp-file + rename.
+        """Persist entries to a memory file through the governed persistence
+        funnel (agent.persist_boundary.governed_persist, kind="memory").
 
-        Previous implementation used open("w") + flock, but "w" truncates the
-        file *before* the lock is acquired, creating a race window where
-        concurrent readers see an empty file. Atomic rename avoids this:
-        readers always see either the old complete file or the new one.
+        This is now the ONLY place a memory file's canonical path can be
+        written from this fork -- ``governed_persist`` performs the actual
+        atomic temp-file + rename write itself (on the pre-cutover
+        passthrough outcome); a denial raises :class:`PersistDenied` (the
+        same clean-error contract a previous write failure already had for
+        callers), and a staged outcome leaves the canonical path untouched
+        (release is a separate, later governed step -- see
+        docs/HERMES_INTEGRATION.md).
         """
+        from agent.persist_boundary import PersistDenied, governed_persist
+
         content = ENTRY_DELIMITER.join(entries) if entries else ""
-        try:
-            # Write to temp file in same directory (same filesystem for atomic rename)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent), suffix=".tmp", prefix=".mem_"
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                atomic_replace(tmp_path, path)
-            except BaseException:
-                # Clean up temp file on any failure
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-        except (OSError, IOError) as e:
-            raise RuntimeError(f"Failed to write memory file {path}: {e}")
+        result = governed_persist("memory", str(path), content, meta={})
+        if result.denied:
+            raise PersistDenied(result.message)
 
 
 def load_on_disk_store() -> "MemoryStore":

@@ -166,6 +166,14 @@ VALID_HOOKS: Set[str] = {
     # plus an observer emitted after an admitted run finishes.
     "pre_run_start",
     "post_run_end",
+    # Mandatory admission before a runtime mutation of a memory/skill/SOUL.md
+    # file reaches its canonical path. The chokepoint (agent.persist_boundary
+    # .governed_persist) sends {session_id, kind, target_path, content_b64,
+    # meta}; the callback returns an "allow" directive that MAY carry
+    # {"digest": ..., "staged": True} to mean the content was diverted into a
+    # governed quarantine (canonical path left untouched -- release is a
+    # separate, later governed step), or "block" to refuse the write outright.
+    "pre_persist_write",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1239,9 +1247,10 @@ class PluginContext:
 
         Required hooks are limited to boundaries where Hermes can prevent
         spend or stop the response from advancing: tool calls, model request
-        reservation/settlement, and scheduler-owned run admission. The
-        callback must return an explicit ``allow``, ``approve``, or ``block``
-        directive. Exceptions and malformed/empty returns fail closed.
+        reservation/settlement, scheduler-owned run admission, and runtime
+        persistence writes. The callback must return an explicit ``allow``,
+        ``approve``, or ``block`` directive. Exceptions and malformed/empty
+        returns fail closed.
 
         Operators make the plugin itself mandatory with
         ``plugins.required: [<plugin-id>]``. A required plugin that is missing,
@@ -1253,6 +1262,7 @@ class PluginContext:
             "pre_api_request",
             "post_api_request",
             "pre_run_start",
+            "pre_persist_write",
         }:
             raise ValueError(
                 "required hook is not an enforceable Hermes boundary"
@@ -2145,7 +2155,7 @@ class PluginManager:
             return []
 
         approval: dict[str, Any] | None = None
-        context: dict[str, str] = {}
+        context: dict[str, Any] = {}
         for plugin_id, callback in active_callbacks:
             try:
                 result = callback(**kwargs)
@@ -2174,9 +2184,21 @@ class PluginManager:
                     "message": message if isinstance(message, str) and message else
                                "BLOCKED: required policy enforcer denied this operation",
                 }]
-            for key in ("run_id", "session_id"):
+            # run_id/session_id carry a scheduler-owned run binding through
+            # (pre_run_start); digest/staged carry a quarantine binding
+            # through (pre_persist_write) -- same pass-through contract,
+            # generalized so a caller-facing directive from get_required_hook_
+            # directive() isn't silently stripped down to the bare action.
+            for key, expected_type in (
+                ("run_id", str),
+                ("session_id", str),
+                ("digest", str),
+                ("staged", bool),
+            ):
                 value = result.get(key)
-                if not isinstance(value, str) or not value:
+                if not isinstance(value, expected_type):
+                    continue
+                if expected_type is str and not value:
                     continue
                 prior = context.get(key)
                 if prior is not None and prior != value:

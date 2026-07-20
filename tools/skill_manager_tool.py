@@ -34,16 +34,14 @@ Directory layout for user skills:
 
 import json
 import logging
-import os
 import re
 import shutil
-import tempfile
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home, display_hermes_home
-from utils import atomic_replace, is_truthy_value
+from utils import is_truthy_value
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -774,36 +772,52 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     return target, None
 
 
+def _skill_target_path(file_path: Path) -> str:
+    """Return ``file_path`` relative to its containing skills root, POSIX-separated.
+
+    Purely descriptive metadata forwarded to the governed persistence funnel
+    (the eventual release-time promotion step uses it to know where the
+    content belongs). A path that doesn't resolve under any known skills
+    root falls back to its last two components -- still a useful audit hint.
+    """
+    root = _containing_skills_root(file_path)
+    try:
+        return file_path.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        parts = file_path.parts[-2:]
+        return "/".join(parts) if len(parts) == 2 else file_path.name
+
+
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
-    Atomically write text content to a file.
-    
-    Uses a temporary file in the same directory and os.replace() to ensure
-    the target file is never left in a partially-written state if the process
-    crashes or is interrupted.
-    
+    Write text content to a skill file through the governed persistence
+    funnel (agent.persist_boundary.governed_persist, kind="skill").
+
+    This is now the ONLY place a skill file's canonical path can be written
+    from this fork -- covers create/edit/patch/write_file and their
+    rollback-to-original writes after a failed security scan uniformly
+    ("canonical paths are never written by the runtime" applies even to a
+    revert). ``governed_persist`` performs the actual atomic temp-file +
+    rename write itself (on the pre-cutover passthrough outcome); a denial
+    raises :class:`PersistDenied` (the same clean-error contract a previous
+    write failure already had for callers -- propagates to the tool
+    registry's broad exception -> error-JSON dispatch wrapper), and a staged
+    outcome leaves the canonical path untouched (release is a separate,
+    later governed step -- see docs/HERMES_INTEGRATION.md).
+
     Args:
         file_path: Target file path
         content: Content to write
         encoding: Text encoding (default: utf-8)
     """
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(
-        dir=str(file_path.parent),
-        prefix=f".{file_path.name}.tmp.",
-        suffix="",
+    from agent.persist_boundary import PersistDenied, governed_persist
+
+    result = governed_persist(
+        "skill", str(file_path), content.encode(encoding),
+        meta={"encoding": encoding, "skill_relative_path": _skill_target_path(file_path)},
     )
-    try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(content)
-        atomic_replace(temp_path, file_path)
-    except Exception:
-        # Clean up temp file on error
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
-        raise
+    if result.denied:
+        raise PersistDenied(result.message)
 
 
 # =============================================================================
