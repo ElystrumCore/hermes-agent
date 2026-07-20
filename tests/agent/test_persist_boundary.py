@@ -467,6 +467,70 @@ class TestSkillManagerSiteWiring:
 
 
 # ---------------------------------------------------------------------------
+# Regression tests for _open_write_mode_findings AST helper
+# ---------------------------------------------------------------------------
+
+
+class TestOpenWriteModeFindings:
+    """Unit tests for the _open_write_mode_findings helper to ensure it reads
+    the correct argument index for function vs. method calls."""
+
+    def test_open_function_with_write_mode_positional_arg_is_caught(self):
+        """open("MEMORY.md", "w") should be flagged (mode is args[1], not args[0])."""
+        source = '''
+def _write_file(path: str, content: str):
+    with open("MEMORY.md", "w") as f:
+        f.write(content)
+'''
+        findings = _open_write_mode_findings(source, "test")
+        assert len(findings) == 1
+        assert "w" in findings[0]
+
+    def test_open_function_with_read_mode_positional_arg_not_flagged(self):
+        """open("data.xlsx", "r") should NOT be flagged (mode "r" has no write chars)."""
+        source = '''
+def read_spreadsheet(path: str):
+    with open("data.xlsx", "r") as f:
+        return f.read()
+'''
+        findings = _open_write_mode_findings(source, "test")
+        assert len(findings) == 0
+
+    def test_path_method_with_write_mode_positional_arg_is_caught(self):
+        """Path(...).open("w") should be flagged (mode is args[0] for method calls)."""
+        source = '''
+from pathlib import Path
+def write_skill(path: Path, content: str):
+    path.open("w").write(content)
+'''
+        findings = _open_write_mode_findings(source, "test")
+        assert len(findings) == 1
+        assert "w" in findings[0]
+
+    def test_open_function_with_keyword_mode_is_caught(self):
+        """open(path, mode="w") with keyword argument should be flagged."""
+        source = '''
+def write_file(path: str, content: str):
+    with open(path, mode="w") as f:
+        f.write(content)
+'''
+        findings = _open_write_mode_findings(source, "test")
+        assert len(findings) == 1
+        assert "w" in findings[0]
+
+    def test_open_with_append_mode_is_caught(self):
+        """open(path, "a") with append mode should be flagged."""
+        source = '''
+def append_log(path: str, entry: str):
+    with open(path, "a") as f:
+        f.write(entry)
+'''
+        findings = _open_write_mode_findings(source, "test")
+        assert len(findings) == 1
+        assert "a" in findings[0]
+
+
+# ---------------------------------------------------------------------------
 # Grep-pin: only the funnel module may perform a canonical write
 #
 # Scoped to the specific write-site FUNCTIONS (via AST), not a whole-file
@@ -509,12 +573,13 @@ def _open_write_mode_findings(source: str, label: str) -> list[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        is_open_call = (isinstance(func, ast.Name) and func.id == "open") or (
-            isinstance(func, ast.Attribute) and func.attr == "open"
-        )
-        if not is_open_call:
+        is_method_call = isinstance(func, ast.Attribute) and func.attr == "open"
+        is_function_call = isinstance(func, ast.Name) and func.id == "open"
+        if not (is_method_call or is_function_call):
             continue
+
         mode_value = None
+        # Check keyword argument first
         for kw in node.keywords:
             if (
                 kw.arg == "mode"
@@ -523,11 +588,17 @@ def _open_write_mode_findings(source: str, label: str) -> list[str]:
             ):
                 mode_value = kw.value.value
                 break
+
+        # If no keyword mode, check positional arguments
         if mode_value is None:
-            for arg in node.args:
+            # For method calls like Path(...).open("w"), mode is args[0]
+            # For function calls like open(path, "w"), mode is args[1]
+            arg_index = 0 if is_method_call else 1
+            if arg_index < len(node.args):
+                arg = node.args[arg_index]
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                     mode_value = arg.value
-                    break
+
         if mode_value is None:
             continue
         if _WRITE_MODE_CHARS & set(mode_value):
