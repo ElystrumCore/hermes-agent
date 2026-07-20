@@ -140,6 +140,83 @@ class TestGovernedPersistDirectives:
 
 
 # ---------------------------------------------------------------------------
+# governed_persist -- enforcer presence gates a bare "allow"
+#
+# A bare "allow" (no `staged` flag) is only a legitimate pre-cutover
+# passthrough when NO required-hook enforcer is wired for pre_persist_write.
+# When one IS wired, invoke_required_hook's own type guard silently strips a
+# missing/non-bool `staged` key rather than blocking, so the resulting
+# directive is shape-identical to the no-enforcer case -- governed_persist
+# must tell the two apart itself (via _enforcer_registered) and fail closed
+# to a local stage rather than guessing it into a canonical write.
+# ---------------------------------------------------------------------------
+
+
+class TestGovernedPersistEnforcerPresence:
+    def test_enforcer_present_bare_allow_stages_locally_not_canonical(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        target = tmp_path / "MEMORY.md"
+        monkeypatch.setattr("hermes_cli.plugins.get_required_hook_directive", _directive("allow"))
+        monkeypatch.setattr(pb, "_enforcer_registered", lambda hook_name: True)
+
+        with caplog.at_level("WARNING"):
+            result = governed_persist("memory", str(target), b"malformed-enforcer-allow")
+
+        assert result.staged is True
+        assert result.denied is False
+        assert not target.exists()
+        assert "enforcer allow without staged" in caplog.text
+
+    def test_enforcer_present_well_formed_staged_allow_is_unaffected(self, tmp_path, monkeypatch):
+        # staged=True short-circuits before the enforcer-presence check runs
+        # at all -- an enforcer that behaves correctly is unaffected by this
+        # fix either way.
+        target = tmp_path / "MEMORY.md"
+        digest = "sha256:" + "b" * 64
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_required_hook_directive",
+            _directive("allow", staged=True, digest=digest),
+        )
+        monkeypatch.setattr(pb, "_enforcer_registered", lambda hook_name: True)
+
+        result = governed_persist("memory", str(target), b"content")
+
+        assert result == PersistResult(staged=True, digest=digest, denied=False, message="")
+        assert not target.exists()
+
+    def test_no_enforcer_bare_allow_is_still_passthrough(self, tmp_path, monkeypatch):
+        # Explicit no-enforcer case, decoupled from the real plugin manager's
+        # test-time default -- pins the other half of the fix: nothing
+        # regresses when there genuinely is no enforcer registered.
+        target = tmp_path / "MEMORY.md"
+        monkeypatch.setattr("hermes_cli.plugins.get_required_hook_directive", _directive("allow"))
+        monkeypatch.setattr(pb, "_enforcer_registered", lambda hook_name: False)
+
+        result = governed_persist("memory", str(target), "hello")
+
+        assert result == PersistResult(staged=False, digest=None, denied=False, message="")
+        assert target.read_text(encoding="utf-8") == "hello"
+
+    def test_enforcer_registered_reads_the_required_hooks_registry(self, monkeypatch):
+        class _FakeManager:
+            _required_hooks = {"pre_persist_write": [("guard", lambda **kw: None)]}
+
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakeManager())
+
+        assert pb._enforcer_registered("pre_persist_write") is True
+        assert pb._enforcer_registered("pre_run_start") is False
+
+    def test_enforcer_registered_fails_closed_on_introspection_error(self, monkeypatch):
+        def boom():
+            raise RuntimeError("plugin manager unavailable")
+
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", boom)
+
+        assert pb._enforcer_registered("pre_persist_write") is True
+
+
+# ---------------------------------------------------------------------------
 # governed_persist -- hook unreachable / unrecognized -> decision-less local stage
 # ---------------------------------------------------------------------------
 
@@ -407,7 +484,55 @@ _FORBIDDEN_WRITE_SNIPPETS = (
     "tempfile.mkstemp(",
     "atomic_replace(",
     ".write_text(",
+    ".write_bytes(",
+    "os.replace(",
+    "os.rename(",
+    "shutil.",
 )
+
+# `open(path, "w")` / `Path(...).open("wb")` / `open(path, mode="a")` don't
+# contain any fixed token above -- the mode string can land in any argument
+# position or as a `mode=` keyword. Caught separately via AST below instead
+# of trying to enumerate every quoting/spacing variant as a substring.
+_WRITE_MODE_CHARS = frozenset("wax+")
+
+
+def _open_write_mode_findings(source: str, label: str) -> list[str]:
+    """AST-scan *source* (a standalone function segment or a whole module)
+    for `open(...)` / `<expr>.open(...)` calls whose mode argument permits
+    writing (contains any of w/a/x/+). A no-mode `open(path)` defaults to
+    read-only text mode and is not flagged.
+    """
+    tree = ast.parse(source)
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_open_call = (isinstance(func, ast.Name) and func.id == "open") or (
+            isinstance(func, ast.Attribute) and func.attr == "open"
+        )
+        if not is_open_call:
+            continue
+        mode_value = None
+        for kw in node.keywords:
+            if (
+                kw.arg == "mode"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                mode_value = kw.value.value
+                break
+        if mode_value is None:
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    mode_value = arg.value
+                    break
+        if mode_value is None:
+            continue
+        if _WRITE_MODE_CHARS & set(mode_value):
+            findings.append(f"{label}: open(...) call with write-capable mode {mode_value!r}")
+    return findings
 
 _WRITE_SITE_FUNCTIONS = (
     ("tools/memory_tool.py", "_write_file"),
@@ -450,6 +575,12 @@ class TestNoDirectCanonicalWriteOutsideTheFunnel:
                     f"write primitive ({snippet!r}) -- route it through "
                     f"agent.persist_boundary.governed_persist instead"
                 )
+            open_findings = _open_write_mode_findings(segment, f"{rel}::{func_name}")
+            assert not open_findings, (
+                f"{rel}::{func_name} still contains a direct write-mode "
+                f"open() call ({open_findings}) -- route it through "
+                f"agent.persist_boundary.governed_persist instead"
+            )
 
     def test_delegating_modules_contain_no_direct_write_primitive(self):
         repo_root = self._repo_root()
@@ -461,6 +592,12 @@ class TestNoDirectCanonicalWriteOutsideTheFunnel:
                     f"({snippet!r}) -- route it through agent.persist_boundary."
                     f"governed_persist instead"
                 )
+            open_findings = _open_write_mode_findings(source, rel)
+            assert not open_findings, (
+                f"{rel} contains a direct write-mode open() call "
+                f"({open_findings}) -- route it through agent.persist_boundary."
+                f"governed_persist instead"
+            )
 
     def test_funnel_module_is_the_one_allowed_writer(self):
         # Sanity check the allowlist isn't hiding a funnel that silently lost

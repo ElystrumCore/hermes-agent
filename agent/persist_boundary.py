@@ -27,11 +27,11 @@ and translates its directive into one of three outcomes:
   and lets it propagate exactly the way a failed write already did (the
   tool registry's broad ``except Exception`` -> ``{"error": ...}`` dispatch
   wrapper) -- no canonical write, no crash.
-* **passthrough** (``action == "allow"`` with no ``staged`` flag): no
-  required-hook enforcer is currently registered for ``pre_persist_write``
-  (the pre-cutover default -- see ``docs/HERMES_INTEGRATION.md`` and the
-  companion agent-lineage plan; deploying the governed install is an
-  explicit, separate cutover, not part of wiring this funnel). This mirrors
+* **passthrough** (``action == "allow"`` with no ``staged`` flag, AND no
+  required-hook enforcer is actually registered for ``pre_persist_write``):
+  this is the pre-cutover default -- see ``docs/HERMES_INTEGRATION.md`` and
+  the companion agent-lineage plan; deploying the governed install is an
+  explicit, separate cutover, not part of wiring this funnel. This mirrors
   the established ``pre_run_start`` precedent (``cron/scheduler.py``,
   ``hermes_cli/kanban_db.py``): a bare "allow" with nothing further attached
   means "no governance is configured for this boundary yet" -- ``governed_
@@ -39,6 +39,18 @@ and translates its directive into one of three outcomes:
   Once an operator opts in (``plugins.required: [agent-lineage]``), the SAME
   ``pre_persist_write`` callback starts returning ``staged=True`` and this
   same code path enforces it with no further changes anywhere.
+
+  Critically, "no ``staged`` flag" alone is NOT enough to earn passthrough:
+  ``governed_persist`` also checks (via ``_enforcer_registered``) whether a
+  required-hook callback is actually wired for ``pre_persist_write`` right
+  now. If one IS registered and still returns a bare "allow" -- a malformed
+  or buggy enforcer, since ``invoke_required_hook``'s own type guard silently
+  drops a non-``bool`` or missing ``staged`` key rather than blocking -- that
+  is indistinguishable, by directive shape alone, from "no enforcer at all".
+  Treating it as passthrough would let a broken enforcer silently disable
+  itself. So when an enforcer IS present, a bare allow is instead routed to
+  the same decision-less local stage as an unreachable/unrecognized
+  directive (see below) -- fail-closed, never a silent canonical write.
 
 When the hook itself is unreachable (the required-hook call raises -- for
 example because the plugin subsystem isn't importable in this execution
@@ -202,6 +214,35 @@ def _stage_local(kind: str, target_path: str, content: bytes, meta: dict[str, An
     )
 
 
+def _enforcer_registered(hook_name: str) -> bool:
+    """True when at least one plugin has called ``register_required_hook``
+    for *hook_name* right now.
+
+    Mirrors how ``PluginManager._validate_required_plugins`` (hermes_cli/
+    plugins.py) answers the same question for ``pre_tool_call`` -- it reads
+    the manager's ``_required_hooks`` registry directly. ``plugins.has_hook``
+    cannot be used here: it only sees the OPTIONAL hook registry populated by
+    ``register_hook``, never the required-hook registry populated by
+    ``register_required_hook`` -- a real pre_persist_write enforcer would
+    never show up in it. There is no dedicated public accessor for the
+    required-hook registry today, so this reaches into the same manager
+    internals the plugin runtime's own validation code does.
+
+    Best-effort: any failure introspecting plugin-runtime internals is
+    treated as "an enforcer IS present" -- the safer default for what this
+    predicate gates (a malformed/unrecognized allow staging locally instead
+    of writing canonical), matching this module's fail-closed posture
+    everywhere else.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        return bool(manager._required_hooks.get(hook_name))
+    except Exception:
+        return True
+
+
 def governed_persist(
     kind: str,
     path: str,
@@ -272,6 +313,20 @@ def governed_persist(
         return PersistResult(staged=True, digest=digest, denied=False, message="")
 
     if action == "allow":
+        if _enforcer_registered("pre_persist_write"):
+            # A required enforcer IS wired for this boundary but returned a
+            # bare "allow" (missing/non-bool `staged` -- invoke_required_
+            # hook's type guard strips it rather than blocking). That is
+            # NOT the pre-cutover passthrough case; it's a malformed
+            # enforcer directive. Never guess it into a canonical write --
+            # fail closed to the same decision-less local stage as an
+            # unreachable/unrecognized hook.
+            logger.warning(
+                "governed_persist: pre_persist_write enforcer allow without "
+                "staged -- staging locally, fail-closed (kind=%s, target=%s)",
+                kind, target_path,
+            )
+            return _stage_local(kind, target_path, content_bytes, meta_dict)
         # No required enforcer is registered for pre_persist_write (the
         # pre-cutover default) -- perform the original canonical write
         # ourselves. See the module docstring's "passthrough" case.
