@@ -99,7 +99,10 @@ class TestHookRegistered:
         }
         assert seen["kind"] == "memory"
         assert seen["path"] == "persist-smoke/probe.md"
-        assert seen["meta"] == {"origin": "persist-smoke"}
+        # Each invocation mints its own session id (see
+        # TestUniqueSession below) -- only "origin" is fixed.
+        assert seen["meta"]["origin"] == "persist-smoke"
+        assert seen["meta"]["session_id"].startswith("persist-smoke:")
 
     def test_probe_content_includes_an_iso_timestamp(self, monkeypatch):
         manager = _FakeManager(required_hooks=_REGISTERED)
@@ -171,6 +174,38 @@ class TestHookRegistered:
             "reason": "no enforcer registered — governed config required for the smoke",
         }
         assert not (tmp_path / "persist-smoke" / "probe.md").exists()
+        # The now-empty persist-smoke/ directory is cleaned up too, not
+        # just the probe file inside it.
+        assert not (tmp_path / "persist-smoke").exists()
+
+    def test_passthrough_leaves_other_files_in_probe_dir_alone(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        # If persist-smoke/ isn't empty after the probe is removed (an
+        # unrelated file happens to live alongside it), rmdir must fail
+        # silently rather than raising -- the cleanup is best-effort.
+        manager = _FakeManager(required_hooks=_REGISTERED)
+        _patch_discovery(monkeypatch, manager)
+        monkeypatch.chdir(tmp_path)
+        sibling = tmp_path / "persist-smoke" / "keepme.txt"
+
+        def fake_governed_persist(kind, path, content, meta=None):
+            probe = tmp_path / path
+            probe.parent.mkdir(parents=True, exist_ok=True)
+            probe.write_bytes(content)
+            sibling.write_text("do not delete")
+            return PersistResult(staged=False, digest=None, denied=False, message="")
+
+        monkeypatch.setattr(
+            "agent.persist_boundary.governed_persist", fake_governed_persist
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args())
+
+        assert exc.value.code == 1
+        assert not (tmp_path / "persist-smoke" / "probe.md").exists()
+        assert sibling.exists()
 
     def test_human_mode_does_not_crash_and_is_not_json(self, monkeypatch, capsys):
         manager = _FakeManager(required_hooks=_REGISTERED)
@@ -188,6 +223,94 @@ class TestHookRegistered:
         with pytest.raises(json.JSONDecodeError):
             json.loads(out)
         assert "OK" in out
+
+
+# ---------------------------------------------------------------------------
+# governed_persist reports staged=True for TWO different reasons: a genuine
+# policy-decision stage (message == "") and its own decision-less local
+# fallback (a non-empty message). Only the former is green.
+# ---------------------------------------------------------------------------
+
+
+class TestLocalFallback:
+    def test_local_fallback_result_exits_one_not_zero(self, monkeypatch, capsys):
+        manager = _FakeManager(required_hooks=_REGISTERED)
+        _patch_discovery(monkeypatch, manager)
+        digest = "sha256:" + "d" * 64
+        fallback_message = (
+            "staged locally: no policy enforcer reachable for pre_persist_write"
+        )
+        monkeypatch.setattr(
+            "agent.persist_boundary.governed_persist",
+            lambda kind, path, content, meta=None: PersistResult(
+                staged=True, digest=digest, denied=False, message=fallback_message
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args())
+
+        assert exc.value.code == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out == {
+            "ok": False,
+            "mode": "local_fallback",
+            "digest": digest,
+            "message": fallback_message,
+        }
+
+    def test_local_fallback_human_mode_reports_fail_not_ok(self, monkeypatch, capsys):
+        manager = _FakeManager(required_hooks=_REGISTERED)
+        _patch_discovery(monkeypatch, manager)
+        monkeypatch.setattr(
+            "agent.persist_boundary.governed_persist",
+            lambda kind, path, content, meta=None: PersistResult(
+                staged=True,
+                digest="sha256:" + "d" * 64,
+                denied=False,
+                message="staged locally: no policy enforcer reachable",
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args(as_json=False))
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "FAIL" in out
+        assert "OK" not in out
+
+
+# ---------------------------------------------------------------------------
+# Each invocation must mint its own session id rather than reuse a fixed
+# default -- otherwise a periodic smoke exhausts its own shared budget over
+# time and starts self-denying.
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueSession:
+    def test_two_invocations_get_two_distinct_session_ids(self, monkeypatch):
+        manager = _FakeManager(required_hooks=_REGISTERED)
+        _patch_discovery(monkeypatch, manager)
+        seen_sessions = []
+
+        def fake_governed_persist(kind, path, content, meta=None):
+            seen_sessions.append((meta or {}).get("session_id"))
+            return PersistResult(
+                staged=True, digest="sha256:" + "e" * 64, denied=False, message=""
+            )
+
+        monkeypatch.setattr(
+            "agent.persist_boundary.governed_persist", fake_governed_persist
+        )
+
+        persist_smoke.run_persist_smoke(_args())
+        persist_smoke.run_persist_smoke(_args())
+
+        assert len(seen_sessions) == 2
+        assert all(seen_sessions)
+        assert seen_sessions[0] != seen_sessions[1]
+        assert all(s.startswith("persist-smoke:") for s in seen_sessions)
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +371,100 @@ class TestHookAbsent:
 
         out = json.loads(capsys.readouterr().out)
         assert "stale plugin version" in out["message"]
+
+
+# ---------------------------------------------------------------------------
+# discover_plugins(force=True) (or registry introspection right after it)
+# raising -- a fail-loud duplicate-required-plugin-name RequiredPluginError,
+# or any other discovery-time exception -- must produce a clean JSON
+# diagnostic, exit 1, and never reach governed_persist. Mirrors main.py's own
+# CLI-startup handling of the same call.
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoveryFailed:
+    def test_required_plugin_error_is_diagnosed_not_raised(self, monkeypatch, capsys):
+        from hermes_cli.plugins import RequiredPluginError
+
+        def fake_discover(force=False):
+            raise RequiredPluginError(
+                "required plugin name 'agent-lineage' is ambiguous; configure "
+                "its path-derived plugin key"
+            )
+
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", fake_discover)
+        called = {"governed_persist": False}
+        monkeypatch.setattr(
+            "agent.persist_boundary.governed_persist",
+            lambda *a, **kw: called.__setitem__("governed_persist", True),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args())
+
+        assert exc.value.code == 1
+        assert called["governed_persist"] is False
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False
+        assert out["mode"] == "discovery-failed"
+        assert "agent-lineage" in out["error"]
+        assert "ambiguous" in out["error"]
+        assert "hint" in out
+
+    def test_generic_discovery_exception_is_diagnosed_not_raised(
+        self, monkeypatch, capsys
+    ):
+        def fake_discover(force=False):
+            raise RuntimeError("plugin directory unreadable")
+
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", fake_discover)
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args())
+
+        assert exc.value.code == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out == {
+            "ok": False,
+            "mode": "discovery-failed",
+            "error": "plugin directory unreadable",
+            "hint": "hermes startup itself would abort — fix plugin discovery first",
+        }
+
+    def test_registry_introspection_failure_after_discovery_is_diagnosed(
+        self, monkeypatch, capsys
+    ):
+        # discover_plugins() itself can succeed while get_plugin_manager()
+        # (or reading its registry) is what actually blows up -- both are
+        # inside the same guarded block.
+        def fake_discover(force=False):
+            return None
+
+        def fake_get_manager():
+            raise RuntimeError("plugin manager singleton not initialized")
+
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", fake_discover)
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", fake_get_manager)
+
+        with pytest.raises(SystemExit) as exc:
+            persist_smoke.run_persist_smoke(_args())
+
+        assert exc.value.code == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["mode"] == "discovery-failed"
+        assert "not initialized" in out["error"]
+
+    def test_human_mode_discovery_failed_is_fail_not_json(self, monkeypatch, capsys):
+        def fake_discover(force=False):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", fake_discover)
+
+        with pytest.raises(SystemExit):
+            persist_smoke.run_persist_smoke(_args(as_json=False))
+
+        out = capsys.readouterr().out
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(out)
+        assert "FAIL" in out
+        assert "boom" in out
