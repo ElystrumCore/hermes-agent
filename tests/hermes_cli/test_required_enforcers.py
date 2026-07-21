@@ -46,6 +46,23 @@ def _plugin(home: Path, name: str, register_body: str) -> Path:
     return directory
 
 
+def _plugin_at(
+    home: Path, dirname: str, declared_name: str, register_body: str = "pass"
+) -> Path:
+    """Like ``_plugin`` but the directory name and the manifest's declared
+    ``name`` can differ -- needed to build a same-source duplicate-name
+    collision (two directories independently declaring the same name)."""
+    directory = home / "plugins" / dirname
+    directory.mkdir(parents=True)
+    (directory / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": declared_name, "version": "0.1.0"}), encoding="utf-8"
+    )
+    (directory / "__init__.py").write_text(
+        f"def register(ctx):\n    {register_body}\n", encoding="utf-8"
+    )
+    return directory
+
+
 def test_required_plugin_must_be_discovered(tmp_path, monkeypatch):
     home = tmp_path / "home"
     _write_config(home, enabled=["missing"], required=["missing"])
@@ -357,6 +374,61 @@ def test_required_model_and_run_boundaries_are_supported(tmp_path, monkeypatch):
         "run_id": "run.hermes.test",
         "session_id": "session.test",
     }
+
+
+# ---------------------------------------------------------------------------
+# Duplicate plugin names across directories -- discovery must fail loudly,
+# not silently let directory-iteration order pick an arbitrary winner.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_required_plugin_name_aborts_startup_naming_both_dirs(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    dir_a = _plugin_at(home, "dup-plug-a", "dup-plug")
+    dir_b = _plugin_at(home, "dup-plug-b", "dup-plug")
+    _write_config(home, required=["dup-plug"])
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(RequiredPluginError) as excinfo:
+        PluginManager().discover_and_load()
+
+    message = str(excinfo.value)
+    assert "dup-plug" in message
+    assert str(dir_a) in message
+    assert str(dir_b) in message
+
+
+def test_duplicate_optional_plugin_name_loads_neither_copy(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / "home"
+    dir_a = _plugin_at(home, "dup-plug-a", "dup-plug")
+    dir_b = _plugin_at(home, "dup-plug-b", "dup-plug")
+    _write_config(home, enabled=["dup-plug"])
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    manager = PluginManager()
+    with caplog.at_level("WARNING"):
+        manager.discover_and_load()
+
+    assert "dup-plug" not in manager._plugins
+    assert str(dir_a) in caplog.text
+    assert str(dir_b) in caplog.text
+
+
+def test_unique_plugin_names_are_unaffected_by_duplicate_check(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _plugin(home, "solo", "ctx.register_hook('on_session_start', lambda **kw: None)")
+    _write_config(home, enabled=["solo"])
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    assert "solo" in manager._plugins
+    assert manager._plugins["solo"].enabled is True
 
 
 def test_conflicting_required_run_bindings_fail_closed(tmp_path, monkeypatch):
