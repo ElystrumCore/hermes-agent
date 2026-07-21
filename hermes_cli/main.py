@@ -296,6 +296,7 @@ from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.persist_smoke import build_persist_smoke_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
@@ -4378,6 +4379,13 @@ def cmd_doctor(args):
     from hermes_cli.doctor import run_doctor
 
     run_doctor(args)
+
+
+def cmd_persist_smoke(args):
+    """Smoke-test the governed persistence funnel (pre_persist_write)."""
+    from hermes_cli.persist_smoke import run_persist_smoke
+
+    run_persist_smoke(args)
 
 
 def cmd_security(args):
@@ -12709,7 +12717,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+        "model", "pairing", "persist-smoke", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -13540,6 +13548,12 @@ def main():
     # doctor command  (parser built in hermes_cli/subcommands/doctor.py)
     # =========================================================================
     build_doctor_parser(subparsers, cmd_doctor=cmd_doctor)
+
+    # =========================================================================
+    # persist-smoke command — governed persistence funnel smoke test
+    # (parser built in hermes_cli/subcommands/persist_smoke.py)
+    # =========================================================================
+    build_persist_smoke_parser(subparsers, cmd_persist_smoke=cmd_persist_smoke)
 
     # =========================================================================
     # security command — on-demand supply-chain audit

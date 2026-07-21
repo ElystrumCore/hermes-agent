@@ -1503,9 +1503,9 @@ class PluginManager:
         # don't collide even when both manifests say ``name: openai``.
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
-        winners: Dict[str, PluginManifest] = {}
-        for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
+        winners: Dict[str, PluginManifest] = self._resolve_manifest_winners(
+            manifests, required
+        )
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
@@ -1600,6 +1600,77 @@ class PluginManager:
                 len(self._plugins),
                 sum(1 for p in self._plugins.values() if p.enabled),
             )
+
+    def _resolve_manifest_winners(
+        self, manifests: List[PluginManifest], required: Set[str]
+    ) -> Dict[str, PluginManifest]:
+        """Collapse discovered manifests to one winner per lookup key.
+
+        Later *sources* legitimately override earlier ones on key collision
+        (a user plugin replacing a bundled one, a project plugin replacing a
+        user one — see the module docstring) — at most one manifest per
+        source for a given key, so that case just keeps the last one seen.
+
+        A collision with more than one manifest from the *same* source for
+        the same key is a different, ambiguous situation: two plugin
+        directories independently declared the same manifest ``name`` (keys
+        are path-derived and fall back to the bare ``name`` for flat
+        top-level plugins, so this is exactly "two directories, same
+        declared name"). There is no principled way to pick a winner, and
+        silently doing so by directory-iteration order (the old behavior)
+        can silently shadow the plugin an operator actually intended to
+        run. Handle it loudly and deterministically instead:
+
+        * if the colliding name/key is in ``plugins.required``, abort
+          startup with a :class:`RequiredPluginError` naming every
+          conflicting directory — a mandatory policy enforcer must never
+          load from an ambiguous source;
+        * otherwise, refuse to load *either* copy and log one warning
+          naming every conflicting directory, so the operator can fix it
+          without either copy silently winning.
+
+        Unique names/keys are entirely unaffected.
+        """
+        by_key: Dict[str, List[PluginManifest]] = {}
+        for manifest in manifests:
+            by_key.setdefault(manifest.key or manifest.name, []).append(manifest)
+
+        winners: Dict[str, PluginManifest] = {}
+        for lookup_key, group in by_key.items():
+            by_source: Dict[str, List[PluginManifest]] = {}
+            for manifest in group:
+                by_source.setdefault(manifest.source, []).append(manifest)
+            dup_source = next(
+                (src for src, entries in by_source.items() if len(entries) > 1),
+                None,
+            )
+            if dup_source is None:
+                # At most one manifest per source -- a single declaration,
+                # or a legitimate cross-source override. Preserve the
+                # original "last source wins" semantics.
+                winners[lookup_key] = group[-1]
+                continue
+
+            dup_manifests = by_source[dup_source]
+            conflict_dirs = sorted(str(m.path) for m in dup_manifests)
+            conflict_desc = (
+                f"plugin name {lookup_key!r} is declared by "
+                f"{len(dup_manifests)} {dup_source} plugin directories: "
+                f"{' and '.join(conflict_dirs)}"
+            )
+            if lookup_key in required or group[0].name in required:
+                raise RequiredPluginError(
+                    f"required {conflict_desc} -- ambiguous which "
+                    "directory is authoritative; remove the duplicate "
+                    "before startup"
+                )
+            logger.warning(
+                "Refusing to load either copy of a duplicate plugin: %s "
+                "(ambiguous -- remove or rename one of the directories)",
+                conflict_desc,
+            )
+            # Neither copy is added to `winners` -- both are skipped.
+        return winners
 
     def _validate_required_plugins(self, required: Set[str]) -> None:
         """Fail startup when any configured mandatory enforcer is ineffective."""
