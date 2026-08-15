@@ -537,57 +537,21 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = scope_block
-        block_error_type = "tool_scope_block"
-        if block_message is None:
-            block_error_type = "plugin_block"
+        guardrail_decision = agent._tool_guardrails.before_call(
+            function_name, final_args
+        )
+        if guardrail_decision.allows_execution:
+            guardrail_decision = None
 
-            def _resolve_pre_tool_block():
-                try:
-                    from hermes_cli.plugins import resolve_pre_tool_block
-
-                    return resolve_pre_tool_block(
-                        function_name,
-                        final_args,
-                        task_id=effective_task_id or "",
-                        session_id=getattr(agent, "session_id", "") or "",
-                        tool_call_id=tool_call_id or "",
-                        turn_id=getattr(agent, "_current_turn_id", "") or "",
-                        api_request_id=getattr(agent, "_current_api_request_id", "")
-                        or "",
-                        middleware_trace=list(state["middleware_trace"]),
-                    )
-                except Exception:
-                    return None
-
-            block_message = (
-                _resolve_pre_tool_block()
-                if authorization_gate is None
-                else authorization_gate.run(_resolve_pre_tool_block)
-            )
-
-        guardrail_decision = None
-        if block_message is None:
-            guardrail_decision = agent._tool_guardrails.before_call(
-                function_name, final_args
-            )
-            if guardrail_decision.allows_execution:
-                guardrail_decision = None
-
-        if block_message is not None or guardrail_decision is not None:
+        if guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True
-            if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
-                error_type = block_error_type
-                error_message = block_message
-            else:
-                result = agent._guardrail_block_result(guardrail_decision)
-                error_type = "guardrail_block"
-                error_message = (
-                    getattr(guardrail_decision, "message", None)
-                    or "Tool blocked by guardrail policy"
-                )
+            result = agent._guardrail_block_result(guardrail_decision)
+            error_type = "guardrail_block"
+            error_message = (
+                getattr(guardrail_decision, "message", None)
+                or "Tool blocked by guardrail policy"
+            )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -628,6 +592,66 @@ def _run_agent_tool_execution_middleware(
         )
         trace.clear()
         trace.extend(request_result.trace)
+        # REQUIRED pre-tool gate runs BEFORE the execution-middleware chain:
+        # the governed-MCP capability middleware consumes the exact-action
+        # reservation this gate mints (running it inside the dispatch callback
+        # meant AFTER middleware — the reservation could never exist yet), and
+        # a scope/policy-blocked tool must never reach middleware at all.
+        # Checking request_args (post-request-middleware) also makes the
+        # reserved argument digest identical to what the execution middleware
+        # presents.
+        block_message = scope_block
+        block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_error_type = "plugin_block"
+
+            def _resolve_pre_tool_block():
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+
+                    return resolve_pre_tool_block(
+                        function_name,
+                        request_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "")
+                        or "",
+                        middleware_trace=list(state["middleware_trace"]),
+                    )
+                except Exception as exc:
+                    # FAIL CLOSED: an unexpected failure around mandatory
+                    # policy hooks must never execute the tool. Bounded
+                    # detail: exception type name only.
+                    return (
+                        "BLOCKED: pre-tool policy enforcement unavailable "
+                        f"({type(exc).__name__})"
+                    )
+
+            block_message = (
+                _resolve_pre_tool_block()
+                if authorization_gate is None
+                else authorization_gate.run(_resolve_pre_tool_block)
+            )
+        if block_message is not None:
+            if begin_execution is not None:
+                begin_execution(None)
+            state["blocked"] = True
+            blocked_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=request_args,
+                result=blocked_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type=block_error_type,
+                error_message=block_message,
+                middleware_trace=list(state["middleware_trace"]),
+            )
+            return blocked_result
         return run_tool_execution_middleware(
             function_name,
             request_args,

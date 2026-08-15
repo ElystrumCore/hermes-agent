@@ -5995,7 +5995,27 @@ def invoke_required_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     let a malformed ``plugins.required`` RAISE out of the tool path instead
     of blocking it.
     """
-    return get_plugin_manager().invoke_required_hook(hook_name, **kwargs)
+    manager = get_plugin_manager()
+    invoke = getattr(manager, "invoke_required_hook", None)
+    if invoke is None:
+        # A legacy/stub manager (tests and embedders monkeypatch
+        # ``_plugin_manager``) has no required-hook support: fail closed only
+        # when the operator actually configured mandatory enforcers; plain
+        # legacy managers with none configured keep their historical allow.
+        try:
+            required = _get_required_plugins()
+        except RequiredPluginError:
+            return [{
+                "action": "block",
+                "message": "BLOCKED: mandatory policy-enforcer configuration is invalid",
+            }]
+        if required:
+            return [{
+                "action": "block",
+                "message": "BLOCKED: required policy enforcement is unavailable on this plugin manager",
+            }]
+        return []
+    return invoke(hook_name, **kwargs)
 
 
 def get_required_hook_directive(hook_name: str, **kwargs: Any) -> Dict[str, Any]:
