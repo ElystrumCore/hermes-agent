@@ -4056,34 +4056,43 @@ class PluginManager:
 
         Unique names/keys are entirely unaffected.
         """
-        by_key: Dict[str, List[PluginManifest]] = {}
+        # Keys are path-derived (directory / category names), so two flat
+        # directories independently declaring the same manifest ``name`` no
+        # longer collide by key — they collide by IDENTITY: same source, same
+        # category namespace, same declared name. Cross-category name reuse
+        # (``tts/openai`` vs ``image_gen/openai``) has different namespaces
+        # and is legitimately untouched.
+        by_identity: Dict[tuple, List[PluginManifest]] = {}
         for manifest in manifests:
-            by_key.setdefault(manifest.key or manifest.name, []).append(manifest)
+            lookup_key = manifest.key or manifest.name
+            category = lookup_key.rsplit("/", 1)[0] if "/" in lookup_key else ""
+            by_identity.setdefault(
+                (manifest.source, category, manifest.name), []
+            ).append(manifest)
 
-        winners: Dict[str, PluginManifest] = {}
-        for lookup_key, group in by_key.items():
-            by_source: Dict[str, List[PluginManifest]] = {}
-            for manifest in group:
-                by_source.setdefault(manifest.source, []).append(manifest)
-            dup_source = next(
-                (src for src, entries in by_source.items() if len(entries) > 1),
-                None,
-            )
-            if dup_source is None:
-                # At most one manifest per source -- a single declaration,
-                # or a legitimate cross-source override. Preserve the
-                # original "last source wins" semantics.
-                winners[lookup_key] = group[-1]
+        def _display_path(raw: Any) -> str:
+            # The scan root comes from the manager's casefolded home key on
+            # Windows; recover the true on-disk casing for the operator-facing
+            # conflict message (entrypoint refs and vanished dirs fall back).
+            try:
+                resolved = Path(str(raw)).resolve(strict=True)
+            except OSError:
+                return str(raw)
+            return str(resolved)
+
+        excluded: Set[int] = set()
+        for (dup_source, _category, dup_name), group in by_identity.items():
+            if len(group) < 2:
                 continue
-
-            dup_manifests = by_source[dup_source]
-            conflict_dirs = sorted(str(m.path) for m in dup_manifests)
+            conflict_dirs = sorted(_display_path(m.path) for m in group)
             conflict_desc = (
-                f"plugin name {lookup_key!r} is declared by "
-                f"{len(dup_manifests)} {dup_source} plugin directories: "
+                f"plugin name {dup_name!r} is declared by "
+                f"{len(group)} {dup_source} plugin directories: "
                 f"{' and '.join(conflict_dirs)}"
             )
-            if lookup_key in required or group[0].name in required:
+            if dup_name in required or any(
+                (m.key or m.name) in required for m in group
+            ):
                 raise RequiredPluginError(
                     f"required {conflict_desc} -- ambiguous which "
                     "directory is authoritative; remove the duplicate "
@@ -4094,7 +4103,16 @@ class PluginManager:
                 "(ambiguous -- remove or rename one of the directories)",
                 conflict_desc,
             )
-            # Neither copy is added to `winners` -- both are skipped.
+            # Neither copy is added to `winners` -- all copies are skipped.
+            excluded.update(id(m) for m in group)
+
+        winners: Dict[str, PluginManifest] = {}
+        for manifest in manifests:
+            if id(manifest) in excluded:
+                continue
+            # Later sources override earlier ones on key collision --
+            # preserve the original "last one wins" semantics per key.
+            winners[manifest.key or manifest.name] = manifest
         return winners
 
     def _validate_required_plugins(self, required: Set[str]) -> None:
@@ -5968,8 +5986,16 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 def invoke_required_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke mandatory policy callbacks with fail-closed aggregation."""
-    return _delivery_manager().invoke_required_hook(hook_name, **kwargs)
+    """Invoke mandatory policy callbacks with fail-closed aggregation.
+
+    Deliberately uses the plain singleton (no forced discovery): startup is
+    responsible for discovery — synchronously when ``plugins.required`` is
+    configured — and an UNDISCOVERED manager fails closed anyway (required
+    enforcers resolve as unavailable → block). Forcing discovery here would
+    let a malformed ``plugins.required`` RAISE out of the tool path instead
+    of blocking it.
+    """
+    return get_plugin_manager().invoke_required_hook(hook_name, **kwargs)
 
 
 def get_required_hook_directive(hook_name: str, **kwargs: Any) -> Dict[str, Any]:
