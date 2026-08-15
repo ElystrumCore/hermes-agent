@@ -6262,7 +6262,7 @@ def run_conversation(
                 )
 
             try:
-                from hermes_cli.plugins import has_hook, invoke_hook as _invoke_hook
+                from hermes_cli.lifecycle import has_hook, invoke_hook as _invoke_hook
                 if has_hook("post_api_request"):
                     _invoke_hook(
                         "post_api_request",

@@ -6157,16 +6157,19 @@ def _get_pre_tool_call_directive_details(
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
     )
+    # ``toolset`` provenance goes ONLY to required enforcers; the optional
+    # observer payload stays byte-identical to the documented hook contract.
+    required_kwargs = dict(hook_kwargs)
     try:
         from tools.registry import registry as _tool_registry
 
-        hook_kwargs["toolset"] = _tool_registry.get_toolset_for_tool(tool_name) or ""
+        required_kwargs["toolset"] = _tool_registry.get_toolset_for_tool(tool_name) or ""
     except Exception:
         # Required enforcers receive an empty provenance field and decide
         # fail-closed themselves. Plugin discovery must not depend on the tool
         # registry being fully initialized yet.
-        hook_kwargs["toolset"] = ""
-    required_results = invoke_required_hook("pre_tool_call", **hook_kwargs)
+        required_kwargs["toolset"] = ""
+    required_results = invoke_required_hook("pre_tool_call", **required_kwargs)
     required_approval: _PreToolCallDirective | None = None
     for result in required_results:
         if not isinstance(result, dict):
