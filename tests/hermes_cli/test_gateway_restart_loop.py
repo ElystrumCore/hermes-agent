@@ -1241,3 +1241,70 @@ class TestLifecycleGuardNeverRaises:
         for value in ("/dev/null", str(tmp_path)):
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", value)
+
+
+
+class TestOversizedDataFileNotAScript:
+    """Aug 2026 live false positive: a command quoting an oversized DATA
+    file (ledger/log/dump) was hard-blocked as a gateway-lifecycle attempt
+    because the referenced-script walker read it, hit the >1 MiB cap, and
+    failed closed. Oversized reads must fail closed only for files that are
+    plausibly executed as scripts; data files are skipped, while definite
+    script positions (shell arguments) and script-shaped files keep the
+    fail-closed verdict."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    def test_heredoc_quoting_oversized_jsonl_not_blocked(self, tmp_path):
+        big = tmp_path / "hermes-policy.jsonl"
+        big.write_text('{"x": 1}\n' * 130_000, encoding="utf-8")  # > 1 MiB
+        command = (
+            "python - <<'PY'\nimport json\nfrom pathlib import Path\n"
+            f'Path("{big.as_posix()}").read_text()\nPY'
+        )
+        assert self._scan(command, cwd=str(tmp_path)) is False
+
+    def test_oversized_sh_script_still_fail_closed(self, tmp_path):
+        big = tmp_path / "deploy.sh"
+        big.write_text("#!/bin/sh\n" + "# filler\n" * 140_000, encoding="utf-8")
+        # Forward-slash spelling: posix shlex mangles backslash paths, so the
+        # native Windows spelling never reaches the walker (a pre-existing
+        # Windows gap, not this patch's scope).
+        assert self._scan(big.as_posix(), cwd=str(tmp_path)) is True
+
+    def test_oversized_extensionless_script_via_shell_still_fail_closed(self, tmp_path):
+        big = tmp_path / "runner"  # no shebang, no script suffix
+        big.write_text("\n".join("# filler" for _ in range(140_000)), encoding="utf-8")
+        # Shell-argument position executes it as a script regardless of shape.
+        assert self._scan(f"bash {big.as_posix()}", cwd=str(tmp_path)) is True
+
+    def test_oversized_data_file_via_shell_position_still_fail_closed(self, tmp_path):
+        big = tmp_path / "payload.jsonl"
+        big.write_text('{"x": 1}\n' * 130_000, encoding="utf-8")
+        assert self._scan(f"bash {big.as_posix()}", cwd=str(tmp_path)) is True
+
+    def test_data_suffix_tokens_are_not_walked_as_scripts(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        data = sub / "notes.jsonl"
+        # Built by concatenation so this test module's own source never
+        # contains a lifecycle-shaped literal for the direct scan.
+        data.write_text(
+            '{"msg": "systemctl restart hermes-" + "gateway"}\n',
+            encoding="utf-8",
+        )
+        # Heredoc body line whose segment-0 token is the data path (the
+        # exact walked shape from the live repro): suffix-filtered, never
+        # read, so the lifecycle text inside the file cannot block a plain
+        # read of it.
+        command = (
+            "python - <<'PY'\nfrom pathlib import Path\n"
+            'Path("sub/notes.jsonl").read_text()\nPY'
+        )
+        assert self._scan(command, cwd=str(tmp_path)) is False

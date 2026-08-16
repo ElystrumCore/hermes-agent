@@ -145,6 +145,27 @@ _BINARY_MAGIC_PREFIXES = (
 )
 _BINARY_SNIFF_BYTES = 4096
 
+# Suffixes plausibly EXECUTED as scripts: an oversized file carrying one
+# of these (or a shebang) keeps the fail-closed oversized verdict.
+_SCRIPT_EXECUTABLE_SUFFIXES = {
+    ".sh", ".bash", ".zsh", ".ksh", ".fish",
+    ".py", ".rb", ".pl", ".js", ".ts",
+    ".ps1", ".bat", ".cmd",
+}
+
+# Suffixes that are never executed as scripts. Bare path-shaped tokens
+# resolving to these are not walked as referenced scripts: a command
+# merely QUOTING a big data file (ledger, log, dump) must not be
+# hard-blocked (live false positive, Aug 2026: a heredoc naming a
+# multi-megabyte JSONL ledger was killed as a lifecycle attempt).
+_DATA_FILE_SUFFIXES = {
+    ".json", ".jsonl", ".log", ".txt", ".md", ".csv", ".tsv",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".xml", ".html", ".htm", ".sql", ".db", ".sqlite", ".sqlite3",
+    ".lock", ".pid", ".gz", ".zip", ".tar", ".tgz",
+    ".bin", ".dat", ".parquet", ".avro", ".pdf", ".docx", ".xlsx",
+}
+
 
 
 
@@ -347,8 +368,16 @@ def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+) -> Iterator[tuple[Path, bool]]:
+    """Yield ``(script, definite_script)`` pairs for referenced files.
+
+    ``definite_script`` is True when the path sits in a position that
+    EXECUTES it as a script (an argument to ``bash``/``sh``/``source``/
+    ``.``); False for bare path-shaped tokens (data files, programs).
+    Oversized reads fail closed only for definite scripts or
+    script-shaped files, so quoting a big data file no longer
+    hard-blocks the command (live false positive, Aug 2026).
+    """
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -360,7 +389,7 @@ def _iter_referenced_shell_scripts(
             if len(segment) > index + 1:
                 resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
                 if resolved is not None:
-                    yield resolved
+                    yield resolved, True
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -386,7 +415,7 @@ def _iter_referenced_shell_scripts(
             }:
                 resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
                 if resolved is not None:
-                    yield resolved
+                    yield resolved, True
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -397,8 +426,11 @@ def _iter_referenced_shell_scripts(
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
-                if resolved is not None:
-                    yield resolved
+                if (
+                    resolved is not None
+                    and resolved.suffix.casefold() not in _DATA_FILE_SUFFIXES
+                ):
+                    yield resolved, False
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -425,8 +457,25 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+def _script_shaped(path: Path, head: bytes, st_mode: int) -> bool:
+    """Plausibly executed as a script? Drives the oversized fail-closed gate."""
+    if head.startswith(b"#!"):
+        return True
+    if path.suffix.casefold() in _SCRIPT_EXECUTABLE_SUFFIXES:
+        return True
+    return bool(st_mode & getattr(stat, "S_IXUSR", 0))
+
+
+def _read_referenced_script(
+    path: Path, *, definite_script: bool = False
+) -> tuple[Optional[str], bool]:
+    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+
+    ``definite_script`` marks paths yielded from a shell invocation
+    position (``bash``/``source``/``.`` arguments): such a file executes
+    as a script regardless of its extension, so the oversized fail-closed
+    verdict always applies to it.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -471,7 +520,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     if b"\x00" in data:
         return None, False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
+        # Fail closed only when the file is plausibly executed as a
+        # script (explicit shell-argument position, shebang, script
+        # suffix, or an executable bit): a lifecycle-shaped command
+        # could hide past the read cap there. Oversized DATA files
+        # (ledgers, logs, sqlite, JSON blobs) are never executed and
+        # used to hard-block any command that merely QUOTED their path.
+        if definite_script or _script_shaped(path, data, metadata.st_mode):
+            return None, True
+        return None, False
     return data.decode("utf-8", errors="replace"), False
 
 
@@ -524,7 +581,9 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path, definite_script in _iter_referenced_shell_scripts(
+        command, cwd=cwd
+    ):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -535,7 +594,9 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe = _read_referenced_script(
+            script_path, definite_script=definite_script
+        )
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
@@ -656,7 +717,7 @@ def _read_script_for_scanning(script_path: str) -> str:
     resolved = _resolve_script_path(script_path)
     if resolved is None:
         return ""
-    script_text, unsafe = _read_referenced_script(resolved)
+    script_text, unsafe = _read_referenced_script(resolved, definite_script=True)
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""
